@@ -1,0 +1,27 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 50051,
+    "max_workers": 10,
+    "model_path": null,
+    "dataset_path": null,
+    "device": "cuda",
+    "fps": 30.0
+  },
+  "client": {
+    "server_host": "localhost",
+    "server_port": 50051,
+    "timeout": 10.0,
+    "control_freq": 30.0,
+    "control_way": "direct",
+    "smooth_window": 0,
+    "max_velocity": 0.0,
+    "planning_frames": 5,
+    "planning_duration": 3.0
+  },
+  "mode": "client",
+  "log_level": "INFO",
+  "log_file": null
+}
+
+

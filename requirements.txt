@@ -1,0 +1,12 @@
+# LeRobot gRPC Inference - 通用依赖
+# 两个环境都需要安装
+
+# gRPC
+grpcio>=1.50.0
+grpcio-tools>=1.50.0
+grpcio-reflection>=1.50.0
+
+# 数据处理
+numpy>=1.20.0
+
+

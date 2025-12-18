@@ -1,0 +1,201 @@
+// lerobot_inference.proto
+// LeRobot 推理服务 gRPC 接口定义
+// 适用于 Astribot 机器人控制
+
+syntax = "proto3";
+
+package lerobot;
+
+// ============================================================================
+// 消息定义
+// ============================================================================
+
+// 观测数据 - 从机器人 Client 发送到推理 Server
+message Observation {
+    // 当前关节状态 [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1)]
+    repeated float joint_positions = 1;
+    
+    // 图像数据 (可选，用于视觉策略)
+    repeated ImageData images = 2;
+    
+    // 时间戳 (Unix timestamp)
+    double timestamp = 3;
+    
+    // Episode 标识
+    int32 episode_id = 4;
+    
+    // 帧索引
+    int32 frame_index = 5;
+    
+    // 额外状态信息 (JSON 格式字符串)
+    string extra_state = 6;
+}
+
+// 图像数据
+message ImageData {
+    // 相机名称 e.g., "cam_left", "cam_right", "cam_wrist"
+    string camera_name = 1;
+    
+    // 图像数据 (JPEG/PNG 编码)
+    bytes data = 2;
+    
+    // 图像尺寸
+    int32 width = 3;
+    int32 height = 4;
+    
+    // 编码格式 "jpeg", "png", "raw"
+    string encoding = 5;
+}
+
+// 动作指令 - 从推理 Server 返回到机器人 Client
+message Action {
+    // LeRobot 格式: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1)]
+    repeated float values = 1;
+    
+    // 是否是最后一帧
+    bool is_terminal = 2;
+    
+    // 置信度 (可选)
+    float confidence = 3;
+    
+    // 状态码
+    StatusCode status = 4;
+    
+    // 错误消息 (如果有)
+    string error_message = 5;
+    
+    // 服务端帧计数
+    int32 server_frame_index = 6;
+}
+
+// 状态码
+enum StatusCode {
+    OK = 0;
+    ERROR = 1;
+    NOT_READY = 2;
+    EPISODE_END = 3;
+    MODEL_NOT_LOADED = 4;
+    INVALID_INPUT = 5;
+}
+
+// 控制命令
+message ControlCommand {
+    CommandType type = 1;
+    map<string, string> params = 2;
+}
+
+// 命令类型
+enum CommandType {
+    CMD_START = 0;
+    CMD_STOP = 1;
+    CMD_RESET = 2;
+    CMD_SET_EPISODE = 3;
+    CMD_GET_STATUS = 4;
+    CMD_LOAD_MODEL = 5;
+    CMD_LOAD_DATASET = 6;
+}
+
+// Action 配置 - 控制输出哪些部件
+message ActionOutputConfig {
+    // 是否包含底盘控制 (默认 false)
+    bool enable_chassis = 1;
+    // 是否包含头部控制 (默认 true)
+    bool enable_head = 2;
+    // 是否包含腰部控制 (默认 true)
+    bool enable_torso = 3;
+}
+
+// 策略配置 - Client 端发送给 Server 端
+message PolicyConfig {
+    // 模式: "model" 或 "dataset"
+    string mode = 1;
+    
+    // 模型路径或 HuggingFace repo id (mode="model" 时使用)
+    string model_path = 2;
+    
+    // 数据集路径 (mode="dataset" 时使用)
+    string dataset_path = 3;
+    
+    // 推理设备 ("cuda", "cpu", "mps")
+    string device = 4;
+    
+    // 策略类型 ("act", "diffusion", "pi0" 等，可选，自动检测)
+    string policy_type = 5;
+    
+    // Action 输出配置 (可选)
+    ActionOutputConfig action_config = 6;
+}
+
+// 服务状态
+message ServiceStatus {
+    // 服务是否就绪
+    bool is_ready = 1;
+    
+    // 模型/数据集名称
+    string model_name = 2;
+    
+    // 当前 episode
+    int32 current_episode = 3;
+    
+    // 当前帧索引
+    int32 current_frame = 4;
+    
+    // 总帧数 (如果已知)
+    int32 total_frames = 5;
+    
+    // 推荐 FPS
+    float fps = 6;
+    
+    // 状态消息
+    string message = 7;
+    
+    // 运行模式 "model" / "dataset"
+    string mode = 8;
+}
+
+// 空消息
+message Empty {}
+
+// 心跳消息
+message Heartbeat {
+    int64 client_timestamp = 1;
+    string client_id = 2;
+}
+
+// 心跳响应
+message HeartbeatResponse {
+    int64 client_timestamp = 1;
+    int64 server_timestamp = 2;
+    bool is_alive = 3;
+}
+
+// ============================================================================
+// 服务定义
+// ============================================================================
+
+service LeRobotInferenceService {
+    // 配置策略 - Client 连接时发送，指定模型/数据集路径
+    rpc Configure(PolicyConfig) returns (ServiceStatus);
+    
+    // 单次推理 (同步)
+    rpc Predict(Observation) returns (Action);
+    
+    // 批量推理
+    rpc PredictBatch(stream Observation) returns (stream Action);
+    
+    // 流式推理 (双向流，用于高频控制)
+    rpc StreamPredict(stream Observation) returns (stream Action);
+    
+    // 发送控制命令
+    rpc Control(ControlCommand) returns (ServiceStatus);
+    
+    // 获取服务状态
+    rpc GetStatus(Empty) returns (ServiceStatus);
+    
+    // 重置推理状态
+    rpc Reset(Empty) returns (ServiceStatus);
+    
+    // 心跳检测
+    rpc Ping(Heartbeat) returns (HeartbeatResponse);
+}
+

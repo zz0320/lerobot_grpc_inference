@@ -1,0 +1,16 @@
+# LeRobot gRPC Inference - Server 端额外依赖
+# 在 lerobot 环境 (Python 3.10) 中安装
+
+-r requirements.txt
+
+# 数据处理
+pandas>=1.5.0
+pyarrow>=10.0.0
+
+# 深度学习 (如果使用模型推理)
+torch>=2.0.0
+
+# LeRobot (如果使用模型推理)
+# lerobot  # 请根据实际情况安装
+
+

@@ -1,0 +1,9 @@
+# LeRobot gRPC Inference - Client 端额外依赖
+# 在机器人侧环境中安装
+
+-r requirements.txt
+
+# Astribot SDK 相关依赖
+# 请根据实际 SDK 要求添加
+
+

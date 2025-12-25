@@ -463,13 +463,21 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
             return self._get_status(f"配置失败: {e}")
     
     def _parse_action_config(self, request: pb2.PolicyConfig) -> Optional[ActionConfig]:
-        """解析 action 配置"""
+        """
+        解析 action 配置
+        
+        protobuf 字段映射到 ActionConfig:
+        - enable_chassis -> execute_chassis
+        - enable_head -> execute_head  
+        - enable_torso -> execute_torso
+        """
         if hasattr(request, 'action_config') and request.HasField('action_config'):
             ac = request.action_config
             return ActionConfig(
-                enable_chassis=ac.enable_chassis if hasattr(ac, 'enable_chassis') else False,
-                enable_head=ac.enable_head if hasattr(ac, 'enable_head') else True,
-                enable_torso=ac.enable_torso if hasattr(ac, 'enable_torso') else True,
+                # protobuf enable_* 字段映射到 execute_* 参数
+                execute_chassis=ac.enable_chassis if hasattr(ac, 'enable_chassis') else False,
+                execute_head=ac.enable_head if hasattr(ac, 'enable_head') else True,
+                execute_torso=ac.enable_torso if hasattr(ac, 'enable_torso') else True,
             )
         return None
     

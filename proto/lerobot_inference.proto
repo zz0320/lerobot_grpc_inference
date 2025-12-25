@@ -1,6 +1,7 @@
 // lerobot_inference.proto
-// LeRobot 推理服务 gRPC 接口定义
+// LeRobot 推理服务 gRPC 接口定义 (精简版)
 // 适用于 Astribot 机器人控制
+// 支持 V2.0 数据格式 (22/25维)
 
 syntax = "proto3";
 
@@ -12,7 +13,7 @@ package lerobot;
 
 // 观测数据 - 从机器人 Client 发送到推理 Server
 message Observation {
-    // 当前关节状态 [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1)]
+    // 当前关节状态 [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), head(2), torso(4), chassis(3)?]
     repeated float joint_positions = 1;
     
     // 图像数据 (可选，用于视觉策略)
@@ -49,7 +50,7 @@ message ImageData {
 
 // 动作指令 - 从推理 Server 返回到机器人 Client
 message Action {
-    // LeRobot 格式: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1)]
+    // V2.0 格式: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), head(2), torso(4), chassis(3)?]
     repeated float values = 1;
     
     // 是否是最后一帧
@@ -78,21 +79,16 @@ enum StatusCode {
     INVALID_INPUT = 5;
 }
 
-// 控制命令
+// 控制命令 (精简: 只保留 RESET 和 SET_EPISODE)
 message ControlCommand {
     CommandType type = 1;
     map<string, string> params = 2;
 }
 
-// 命令类型
+// 命令类型 (精简版)
 enum CommandType {
-    CMD_START = 0;
-    CMD_STOP = 1;
-    CMD_RESET = 2;
-    CMD_SET_EPISODE = 3;
-    CMD_GET_STATUS = 4;
-    CMD_LOAD_MODEL = 5;
-    CMD_LOAD_DATASET = 6;
+    CMD_RESET = 0;
+    CMD_SET_EPISODE = 1;
 }
 
 // Action 配置 - 控制输出哪些部件
@@ -156,21 +152,8 @@ message ServiceStatus {
 // 空消息
 message Empty {}
 
-// 心跳消息
-message Heartbeat {
-    int64 client_timestamp = 1;
-    string client_id = 2;
-}
-
-// 心跳响应
-message HeartbeatResponse {
-    int64 client_timestamp = 1;
-    int64 server_timestamp = 2;
-    bool is_alive = 3;
-}
-
 // ============================================================================
-// 服务定义
+// 服务定义 (精简版)
 // ============================================================================
 
 service LeRobotInferenceService {
@@ -180,13 +163,10 @@ service LeRobotInferenceService {
     // 单次推理 (同步)
     rpc Predict(Observation) returns (Action);
     
-    // 批量推理
-    rpc PredictBatch(stream Observation) returns (stream Action);
-    
     // 流式推理 (双向流，用于高频控制)
     rpc StreamPredict(stream Observation) returns (stream Action);
     
-    // 发送控制命令
+    // 发送控制命令 (RESET / SET_EPISODE)
     rpc Control(ControlCommand) returns (ServiceStatus);
     
     // 获取服务状态
@@ -194,8 +174,4 @@ service LeRobotInferenceService {
     
     // 重置推理状态
     rpc Reset(Empty) returns (ServiceStatus);
-    
-    // 心跳检测
-    rpc Ping(Heartbeat) returns (HeartbeatResponse);
 }
-

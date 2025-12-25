@@ -27,7 +27,7 @@ if _version_not_supported:
 
 class LeRobotInferenceServiceStub(object):
     """============================================================================
-    服务定义
+    服务定义 (精简版)
     ============================================================================
 
     """
@@ -45,11 +45,6 @@ class LeRobotInferenceServiceStub(object):
                 _registered_method=True)
         self.Predict = channel.unary_unary(
                 '/lerobot.LeRobotInferenceService/Predict',
-                request_serializer=lerobot__inference__pb2.Observation.SerializeToString,
-                response_deserializer=lerobot__inference__pb2.Action.FromString,
-                _registered_method=True)
-        self.PredictBatch = channel.stream_stream(
-                '/lerobot.LeRobotInferenceService/PredictBatch',
                 request_serializer=lerobot__inference__pb2.Observation.SerializeToString,
                 response_deserializer=lerobot__inference__pb2.Action.FromString,
                 _registered_method=True)
@@ -73,16 +68,11 @@ class LeRobotInferenceServiceStub(object):
                 request_serializer=lerobot__inference__pb2.Empty.SerializeToString,
                 response_deserializer=lerobot__inference__pb2.ServiceStatus.FromString,
                 _registered_method=True)
-        self.Ping = channel.unary_unary(
-                '/lerobot.LeRobotInferenceService/Ping',
-                request_serializer=lerobot__inference__pb2.Heartbeat.SerializeToString,
-                response_deserializer=lerobot__inference__pb2.HeartbeatResponse.FromString,
-                _registered_method=True)
 
 
 class LeRobotInferenceServiceServicer(object):
     """============================================================================
-    服务定义
+    服务定义 (精简版)
     ============================================================================
 
     """
@@ -101,13 +91,6 @@ class LeRobotInferenceServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def PredictBatch(self, request_iterator, context):
-        """批量推理
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
     def StreamPredict(self, request_iterator, context):
         """流式推理 (双向流，用于高频控制)
         """
@@ -116,7 +99,7 @@ class LeRobotInferenceServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def Control(self, request, context):
-        """发送控制命令
+        """发送控制命令 (RESET / SET_EPISODE)
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -136,13 +119,6 @@ class LeRobotInferenceServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def Ping(self, request, context):
-        """心跳检测
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
 
 def add_LeRobotInferenceServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -153,11 +129,6 @@ def add_LeRobotInferenceServiceServicer_to_server(servicer, server):
             ),
             'Predict': grpc.unary_unary_rpc_method_handler(
                     servicer.Predict,
-                    request_deserializer=lerobot__inference__pb2.Observation.FromString,
-                    response_serializer=lerobot__inference__pb2.Action.SerializeToString,
-            ),
-            'PredictBatch': grpc.stream_stream_rpc_method_handler(
-                    servicer.PredictBatch,
                     request_deserializer=lerobot__inference__pb2.Observation.FromString,
                     response_serializer=lerobot__inference__pb2.Action.SerializeToString,
             ),
@@ -181,11 +152,6 @@ def add_LeRobotInferenceServiceServicer_to_server(servicer, server):
                     request_deserializer=lerobot__inference__pb2.Empty.FromString,
                     response_serializer=lerobot__inference__pb2.ServiceStatus.SerializeToString,
             ),
-            'Ping': grpc.unary_unary_rpc_method_handler(
-                    servicer.Ping,
-                    request_deserializer=lerobot__inference__pb2.Heartbeat.FromString,
-                    response_serializer=lerobot__inference__pb2.HeartbeatResponse.SerializeToString,
-            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'lerobot.LeRobotInferenceService', rpc_method_handlers)
@@ -196,7 +162,7 @@ def add_LeRobotInferenceServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class LeRobotInferenceService(object):
     """============================================================================
-    服务定义
+    服务定义 (精简版)
     ============================================================================
 
     """
@@ -243,33 +209,6 @@ class LeRobotInferenceService(object):
             request,
             target,
             '/lerobot.LeRobotInferenceService/Predict',
-            lerobot__inference__pb2.Observation.SerializeToString,
-            lerobot__inference__pb2.Action.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def PredictBatch(request_iterator,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.stream_stream(
-            request_iterator,
-            target,
-            '/lerobot.LeRobotInferenceService/PredictBatch',
             lerobot__inference__pb2.Observation.SerializeToString,
             lerobot__inference__pb2.Action.FromString,
             options,
@@ -380,33 +319,6 @@ class LeRobotInferenceService(object):
             '/lerobot.LeRobotInferenceService/Reset',
             lerobot__inference__pb2.Empty.SerializeToString,
             lerobot__inference__pb2.ServiceStatus.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def Ping(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/lerobot.LeRobotInferenceService/Ping',
-            lerobot__inference__pb2.Heartbeat.SerializeToString,
-            lerobot__inference__pb2.HeartbeatResponse.FromString,
             options,
             channel_credentials,
             insecure,

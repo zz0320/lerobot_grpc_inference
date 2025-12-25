@@ -1,73 +1,83 @@
 # -*- coding: utf-8 -*-
 """
-配置管理
+配置管理 (精简版)
 """
 
-import os
-import json
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 from .constants import (
     DEFAULT_CONTROL_FREQ,
     DEFAULT_GRPC_PORT,
     DEFAULT_GRPC_HOST,
-    LEROBOT_ACTION_DIM_V2,
-    LEROBOT_ACTION_DIM_V2_NO_CHASSIS,
+    LEROBOT_ACTION_DIM_NO_CHASSIS,
+    LEROBOT_ACTION_DIM_WITH_CHASSIS,
 )
 
 
 @dataclass
 class ActionConfig:
-    """Action 输出配置"""
-    # 是否包含底盘控制 (可选)
-    enable_chassis: bool = False
-    # 是否包含头部控制
-    enable_head: bool = True
-    # 是否包含腰部控制
-    enable_torso: bool = True
+    """
+    Action 配置
+    
+    分离三个概念:
+    1. state_dim: 输入 state 的维度 (22 或 25)，由机器人状态采集决定
+    2. action_dim: 模型/数据集输出的 action 维度 (22 或 25)，由训练时决定
+    3. execute_chassis: 执行时是否控制底盘 (只影响发送给机器人的命令)
+    """
+    # ========== 输入配置 ==========
+    # 输入 state 是否包含底盘 (影响 Client 采集的状态维度)
+    state_includes_chassis: bool = False
+    
+    # ========== 执行配置 ==========
+    # 执行 action 时是否控制底盘 (即使 action 有 25 维，也可以选择不执行底盘)
+    execute_chassis: bool = False
+    # 是否执行头部控制
+    execute_head: bool = True
+    # 是否执行腰部控制
+    execute_torso: bool = True
     
     @property
-    def action_dim(self) -> int:
-        """计算 action 维度"""
-        dim = 14 + 2  # arm_left(7) + arm_right(7) + gripper_left(1) + gripper_right(1)
-        if self.enable_head:
-            dim += 2
-        if self.enable_torso:
-            dim += 4
-        if self.enable_chassis:
-            dim += 3
-        return dim
+    def state_dim(self) -> int:
+        """输入 state 维度"""
+        # 基础: arm_left(7) + arm_right(7) + gripper_left(1) + gripper_right(1) + head(2) + torso(4) = 22
+        return 25 if self.state_includes_chassis else 22
+    
+    # ========== 兼容旧接口 ==========
+    @property
+    def enable_chassis(self) -> bool:
+        """兼容旧接口"""
+        return self.execute_chassis
     
     @property
-    def enabled_parts(self) -> List[str]:
-        """获取启用的部件列表"""
-        parts = ['arm_left', 'arm_right', 'gripper_left', 'gripper_right']
-        if self.enable_head:
-            parts.append('head')
-        if self.enable_torso:
-            parts.append('torso')
-        if self.enable_chassis:
-            parts.append('chassis')
-        return parts
+    def enable_head(self) -> bool:
+        """兼容旧接口"""
+        return self.execute_head
+    
+    @property
+    def enable_torso(self) -> bool:
+        """兼容旧接口"""
+        return self.execute_torso
 
 
 @dataclass
 class ServerConfig:
-    """Server 配置"""
+    """
+    Server 配置
+    
+    注意: Server 以空闲模式启动，等待 Client 通过 Configure() 指定模型/数据集
+    """
     host: str = DEFAULT_GRPC_HOST
     port: int = DEFAULT_GRPC_PORT
     max_workers: int = 10
     
-    # 模型配置
-    model_path: Optional[str] = None
-    dataset_path: Optional[str] = None
+    # 推理设备 (默认值，Client 可覆盖)
     device: str = "cuda"
     
     # 推理配置
     fps: float = DEFAULT_CONTROL_FREQ
     
-    # Action 配置
+    # Action 配置 (默认值，Client 可覆盖)
     action_config: ActionConfig = field(default_factory=ActionConfig)
 
 
@@ -111,103 +121,3 @@ class ClientConfig:
         elif self.dataset_path:
             return "dataset"
         return "none"
-
-
-@dataclass
-class Config:
-    """
-    统一配置类
-    
-    支持从文件、环境变量、命令行参数加载
-    """
-    server: ServerConfig = field(default_factory=ServerConfig)
-    client: ClientConfig = field(default_factory=ClientConfig)
-    
-    # 运行模式
-    mode: str = "client"  # "server" or "client"
-    
-    # 日志配置
-    log_level: str = "INFO"
-    log_file: Optional[str] = None
-    
-    @classmethod
-    def from_file(cls, path: str) -> "Config":
-        """从 JSON 文件加载配置"""
-        with open(path, 'r') as f:
-            data = json.load(f)
-        return cls.from_dict(data)
-    
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Config":
-        """从字典加载配置"""
-        config = cls()
-        
-        if 'server' in data:
-            server_data = data['server'].copy()
-            # 处理嵌套的 action_config
-            if 'action_config' in server_data:
-                server_data['action_config'] = ActionConfig(**server_data['action_config'])
-            config.server = ServerConfig(**server_data)
-        if 'client' in data:
-            client_data = data['client'].copy()
-            # 处理嵌套的 action_config
-            if 'action_config' in client_data:
-                client_data['action_config'] = ActionConfig(**client_data['action_config'])
-            config.client = ClientConfig(**client_data)
-        if 'mode' in data:
-            config.mode = data['mode']
-        if 'log_level' in data:
-            config.log_level = data['log_level']
-        if 'log_file' in data:
-            config.log_file = data['log_file']
-        
-        return config
-    
-    @classmethod
-    def from_env(cls) -> "Config":
-        """从环境变量加载配置"""
-        config = cls()
-        
-        # Server 配置
-        if os.getenv('LEROBOT_SERVER_HOST'):
-            config.server.host = os.getenv('LEROBOT_SERVER_HOST')
-        if os.getenv('LEROBOT_SERVER_PORT'):
-            config.server.port = int(os.getenv('LEROBOT_SERVER_PORT'))
-        if os.getenv('LEROBOT_MODEL_PATH'):
-            config.server.model_path = os.getenv('LEROBOT_MODEL_PATH')
-        if os.getenv('LEROBOT_DATASET_PATH'):
-            config.server.dataset_path = os.getenv('LEROBOT_DATASET_PATH')
-        if os.getenv('LEROBOT_DEVICE'):
-            config.server.device = os.getenv('LEROBOT_DEVICE')
-        
-        # Client 配置
-        if os.getenv('LEROBOT_CLIENT_HOST'):
-            config.client.server_host = os.getenv('LEROBOT_CLIENT_HOST')
-        if os.getenv('LEROBOT_CLIENT_PORT'):
-            config.client.server_port = int(os.getenv('LEROBOT_CLIENT_PORT'))
-        if os.getenv('LEROBOT_CONTROL_FREQ'):
-            config.client.control_freq = float(os.getenv('LEROBOT_CONTROL_FREQ'))
-        
-        # 通用配置
-        if os.getenv('LEROBOT_MODE'):
-            config.mode = os.getenv('LEROBOT_MODE')
-        if os.getenv('LEROBOT_LOG_LEVEL'):
-            config.log_level = os.getenv('LEROBOT_LOG_LEVEL')
-        
-        return config
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """转换为字典"""
-        return {
-            'server': asdict(self.server),
-            'client': asdict(self.client),
-            'mode': self.mode,
-            'log_level': self.log_level,
-            'log_file': self.log_file
-        }
-    
-    def save(self, path: str):
-        """保存配置到文件"""
-        with open(path, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
-

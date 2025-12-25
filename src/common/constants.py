@@ -1,25 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-常量定义
+常量定义 (精简版 - 仅支持 V2.0)
 """
 
 # ============================================================================
-# 数据集版本配置
+# V2.0 数据集维度配置
 # ============================================================================
 
-# V1.0 数据集: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1)]
-LEROBOT_ACTION_DIM_V1 = 16
+# V2.0 数据集 (不含底盘): [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), head(2), torso(4)]
+LEROBOT_ACTION_DIM_NO_CHASSIS = 22
 
-# V2.0 数据集: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), 
-#               head(2), torso(4), chassis(3)]
-LEROBOT_ACTION_DIM_V2 = 25
+# V2.0 数据集 (含底盘): [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), head(2), torso(4), chassis(3)]
+LEROBOT_ACTION_DIM_WITH_CHASSIS = 25
 
-# V2.0 无底盘: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1),
-#               head(2), torso(4)]
-LEROBOT_ACTION_DIM_V2_NO_CHASSIS = 22
-
-# 默认使用 V2.0
-LEROBOT_ACTION_DIM = LEROBOT_ACTION_DIM_V2
+# 默认使用不含底盘的维度
+LEROBOT_ACTION_DIM = LEROBOT_ACTION_DIM_NO_CHASSIS
 
 # ============================================================================
 # Action 各部件维度配置
@@ -47,7 +42,7 @@ ACTION_INDEX_CONFIG = {
 }
 
 # ============================================================================
-# 手臂关节索引 (兼容 V1.0)
+# 关节索引
 # ============================================================================
 
 ARM_LEFT_INDICES = list(range(0, 7))
@@ -58,13 +53,13 @@ ARM_INDICES = ARM_LEFT_INDICES + ARM_RIGHT_INDICES
 GRIPPER_LEFT_INDEX = 14
 GRIPPER_RIGHT_INDEX = 15
 
-# 头部索引 (V2.0)
+# 头部索引
 HEAD_INDICES = list(range(16, 18))
 
-# 腰部索引 (V2.0)
+# 腰部索引
 TORSO_INDICES = list(range(18, 22))
 
-# 底盘索引 (V2.0)
+# 底盘索引
 CHASSIS_INDICES = list(range(22, 25))
 
 # ============================================================================
@@ -103,32 +98,6 @@ ASTRIBOT_DOF_CONFIG = {
 }
 
 # ============================================================================
-# 数据集列名配置 (用于解析 parquet 文件)
-# ============================================================================
-
-# V2.0 数据集 action 列名
-DATASET_ACTION_COLUMNS_V2 = [
-    'action.arm_left',
-    'action.arm_right',
-    'action.gripper_left',
-    'action.gripper_right',
-    'action.head',
-    'action.torso',
-    'action.chassis',
-]
-
-# V2.0 数据集 observation state 列名
-DATASET_STATE_COLUMNS_V2 = [
-    'observation.state.arm_left.position',
-    'observation.state.arm_right.position',
-    'observation.state.gripper_left.position',
-    'observation.state.gripper_right.position',
-    'observation.state.head.position',
-    'observation.state.torso.position',
-    'observation.state.chassis.position',
-]
-
-# ============================================================================
 # 默认配置
 # ============================================================================
 
@@ -140,5 +109,3 @@ DEFAULT_GRPC_HOST = "0.0.0.0"
 GRPC_MAX_MESSAGE_LENGTH = 50 * 1024 * 1024  # 50MB
 GRPC_KEEPALIVE_TIME_MS = 10000
 GRPC_KEEPALIVE_TIMEOUT_MS = 5000
-
-

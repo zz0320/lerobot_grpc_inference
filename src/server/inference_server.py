@@ -92,49 +92,52 @@ class TemporalEnsembleBuffer:
     """
     Temporal Ensemble 缓冲区
     
-    实现 ACT 风格的 temporal ensemble:
+    参考 ACT 官方实现的 temporal ensemble:
     - 缓存多个 action chunk 的预测
     - 使用指数加权平均融合当前时间步的 actions
     
     ==================== 核心逻辑 ====================
     
-    假设 chunk_size=100, n_action_steps=10:
+    假设 chunk_size=100, n_action_steps=30:
     
-    Step 0:  预测 chunk_0，chunk_0[0..99] 对应 step 0..99
-    Step 10: 预测 chunk_1，chunk_1[0..99] 对应 step 10..109
-    Step 20: 预测 chunk_2，chunk_2[0..99] 对应 step 20..119
+    Step 0:  推理 chunk_0，chunk_0[0..99] 对应 step 0..99
+    Step 30: 推理 chunk_1，chunk_1[0..99] 对应 step 30..129
+    Step 60: 推理 chunk_2，chunk_2[0..99] 对应 step 60..159
     
-    在 Step 15 时，有两个 chunk 覆盖:
-      - chunk_0[15]: 这个预测在 15 步之前做出 (chunk 年龄 = 15)
-      - chunk_1[5]:  这个预测在 5 步之前做出 (chunk 年龄 = 5)
+    在 Step 60 时，有三个 chunk 覆盖:
+      - chunk_0[60]: 模型在 step 0 时预测的 step 60 的 action
+      - chunk_1[30]: 模型在 step 30 时预测的 step 60 的 action  
+      - chunk_2[0]:  模型在 step 60 时预测的 step 60 的 action
     
-    融合权重: w = exp(-coeff * chunk_age)
-      - chunk_1 的 age=5，权重 = exp(-0.01 * 5) = 0.951
-      - chunk_0 的 age=15，权重 = exp(-0.01 * 15) = 0.861
-      - 归一化后: chunk_1 占比 52.5%, chunk_0 占比 47.5%
+    融合权重 (按 chunk 顺序索引，从旧到新):
+      weights = exp(-coeff * [0, 1, 2]) = [1.0, 0.99, 0.98] (coeff=0.01)
+      
+      归一化后: chunk_0 占 33.7%, chunk_1 占 33.3%, chunk_2 占 33.0%
     
-    注意: chunk_age = global_step - start_step = idx (在 chunk 内的位置)
+    ==================== 权重解释 ====================
     
-    这意味着: 
-    - 越新预测的 chunk，权重越高（因为基于最新观测）
-    - 等价地：chunk 内靠前的 action 权重更高
+    索引 0 (最旧的 chunk) 权重最高的原因:
+    - 旧 chunk 在当前时间步的预测使用了 chunk 内更靠后的索引
+    - 例如 chunk_0[60] vs chunk_2[0]
+    - 模型对 "当前步" 的预测 (idx=0) vs "60步后" 的预测 (idx=60)
+    - 这种设计让多个预测结果平滑融合
     
     ==================== 参数调优 ====================
     
     temporal_ensemble_coeff 越大:
-      - 权重衰减越快
-      - 更依赖最新的预测
-      - 响应更快但可能抖动
+      - 权重差异越大
+      - 更依赖旧的 chunk (更稳定的远期预测)
+      - 动作更平滑
     
-    temporal_ensemble_coeff 越小:
-      - 权重衰减越慢
-      - 更多历史预测参与融合
-      - 更平滑但响应较慢
+    temporal_ensemble_coeff 越小 (趋近于 0):
+      - 权重趋于均匀
+      - 所有 chunk 权重相等
+      - 简单平均
     
     推荐值:
-      - 0.01: 标准设置，平滑与响应的平衡
-      - 0.1:  快速响应，适合需要即时反应的任务
-      - 0.001: 超平滑，适合缓慢精细操作
+      - 0.01: 标准设置，轻微倾向旧预测
+      - 0.1:  较强倾向旧预测，更平滑
+      - 0.0:  均匀权重，简单平均
     """
     
     def __init__(
@@ -242,10 +245,10 @@ class TemporalEnsembleBuffer:
         """
         获取当前时间步的融合 action
         
-        ACT Temporal Ensemble 逻辑:
-        - 多个 chunk 可能覆盖当前时间步
-        - 越新预测的 chunk（age 越小），权重越高
-        - age = global_step - start_step (chunk 是多少步之前预测的)
+        参考 ACT 官方实现的 Temporal Ensemble 逻辑:
+        - 收集所有覆盖当前时间步的 chunk 预测
+        - 按 chunk 的顺序 (从旧到新) 分配权重: exp(-k * 0), exp(-k * 1), exp(-k * 2), ...
+        - 旧的 chunk (在列表前面) 权重更高 (因为它们在 chunk 内的索引更大，预测更远)
         
         Returns:
             融合后的单步 action，如果没有可用的 chunk 返回 None
@@ -254,7 +257,6 @@ class TemporalEnsembleBuffer:
             return None
         
         actions = []
-        weights = []
         chunk_info = []  # 用于调试日志
         
         for item in self.chunks:
@@ -266,35 +268,38 @@ class TemporalEnsembleBuffer:
             
             if 0 <= idx < len(chunk):
                 actions.append(chunk[idx])
-                
-                # 权重: 基于 chunk 的"年龄"（chunk 是多少步之前预测的）
-                # age = 0 表示这个 chunk 是刚刚预测的（最新的）
-                # age 越大说明 chunk 越老，权重越低
-                chunk_age = self.global_step - start_step
-                weight = np.exp(-self.temporal_ensemble_coeff * chunk_age)
-                weights.append(weight)
-                chunk_info.append(f"chunk@{start_step}[{idx}],age={chunk_age}")
+                chunk_info.append(f"chunk@{start_step}[{idx}]")
         
         if not actions:
             logger.warning(f"步骤 {self.global_step} 没有可用的 action")
             return None
         
-        # 归一化权重
-        weights = np.array(weights, dtype=np.float32)
+        n_actions = len(actions)
+        
+        if n_actions == 1:
+            # 只有一个 chunk，直接返回
+            if self.global_step % 20 == 0:
+                logger.info(f"TE @ step {self.global_step}: 使用单一 chunk {chunk_info[0]}")
+            return actions[0]
+        
+        # 多个 chunk 需要融合
+        # 按顺序索引计算权重: [exp(-k*0), exp(-k*1), exp(-k*2), ...]
+        # 索引 0 (最旧的 chunk) 权重最高
+        indices = np.arange(n_actions)
+        weights = np.exp(-self.temporal_ensemble_coeff * indices)
         weights_normalized = weights / weights.sum()
         
         # 加权平均
-        action = np.zeros(self.action_dim, dtype=np.float32)
-        for w, a in zip(weights_normalized, actions):
-            action += w * a
+        actions_array = np.array(actions)  # (n_actions, action_dim)
+        action = np.sum(actions_array * weights_normalized[:, np.newaxis], axis=0)
         
-        # 每 20 步或有多个 chunk 融合时打印详细日志
-        if self.global_step % 20 == 0 or len(actions) > 1:
-            logger.info(f"TE @ step {self.global_step}: 融合 {len(actions)} 个 chunks")
+        # 每 20 步打印详细日志
+        if self.global_step % 20 == 0:
+            logger.info(f"TE @ step {self.global_step}: 融合 {n_actions} 个 chunks (coeff={self.temporal_ensemble_coeff})")
             for i, (info, w_raw, w_norm) in enumerate(zip(chunk_info, weights, weights_normalized)):
                 logger.info(f"  [{i}] {info} -> w_raw={w_raw:.4f}, w_norm={w_norm:.2%}")
         
-        return action
+        return action.astype(np.float32)
     
     def step(self):
         """前进一个时间步"""

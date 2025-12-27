@@ -61,30 +61,6 @@ class ActionConfig:
 
 
 @dataclass
-class TemporalEnsembleConfig:
-    """
-    Temporal Ensemble 配置
-    
-    实现类似 ACT 的 temporal ensemble 机制:
-    - 缓存多个 action chunk 预测
-    - 使用指数加权平均融合当前时间步的 actions
-    """
-    # 是否启用 temporal ensemble
-    enabled: bool = False
-    
-    # 每次推理后执行多少步再重新推理 (类似 ACT 的 n_action_steps)
-    # 设为 1 表示每步都推理，设为 chunk_size 表示用完整个 chunk 再推理
-    n_action_steps: int = 1
-    
-    # 指数衰减系数 (越大表示越重视新预测)
-    # w = exp(-coeff * age)，age 是 chunk 的年龄
-    temporal_ensemble_coeff: float = 0.01
-    
-    # 最大缓存的 chunk 数量 (0 表示不限制，根据 chunk_size 自动管理)
-    max_chunks: int = 0
-
-
-@dataclass
 class ServerConfig:
     """
     Server 配置
@@ -103,9 +79,6 @@ class ServerConfig:
     
     # Action 配置 (默认值，Client 可覆盖)
     action_config: ActionConfig = field(default_factory=ActionConfig)
-    
-    # Temporal Ensemble 配置
-    temporal_ensemble_config: TemporalEnsembleConfig = field(default_factory=TemporalEnsembleConfig)
 
 
 @dataclass

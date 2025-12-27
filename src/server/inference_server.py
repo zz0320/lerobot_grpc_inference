@@ -6,7 +6,7 @@ LeRobot 推理服务器 (精简版)
 直接复用 LeRobot 的推理逻辑:
 - 使用 get_policy_class 和 from_pretrained 加载模型
 - 使用 make_pre_post_processors 创建预处理器和后处理器
-- 使用 policy.predict_action_chunk 或 policy.select_action 进行推理
+- 使用 policy.select_action 进行推理
 
 支持两种模式:
 1. 模型推理模式: 使用训练好的策略模型
@@ -44,7 +44,7 @@ except ImportError:
         print("警告: 未找到 protobuf 生成文件，请先运行 scripts/generate_proto.sh")
 
 # 导入通用模块
-from src.common.config import ServerConfig, ActionConfig, TemporalEnsembleConfig
+from src.common.config import ServerConfig, ActionConfig
 from src.common.utils import setup_logging
 from src.common.constants import (
     LEROBOT_ACTION_DIM,
@@ -83,249 +83,6 @@ except ImportError:
     pass
 
 logger = logging.getLogger("lerobot_inference.server")
-
-
-# ============================================================================
-# Temporal Ensemble Buffer
-# ============================================================================
-class TemporalEnsembleBuffer:
-    """
-    Temporal Ensemble 缓冲区
-    
-    参考 ACT 官方实现的 temporal ensemble:
-    - 缓存多个 action chunk 的预测
-    - 使用指数加权平均融合当前时间步的 actions
-    
-    ==================== 核心逻辑 ====================
-    
-    假设 chunk_size=100, n_action_steps=30:
-    
-    Step 0:  推理 chunk_0，chunk_0[0..99] 对应 step 0..99
-    Step 30: 推理 chunk_1，chunk_1[0..99] 对应 step 30..129
-    Step 60: 推理 chunk_2，chunk_2[0..99] 对应 step 60..159
-    
-    在 Step 60 时，有三个 chunk 覆盖:
-      - chunk_0[60]: 模型在 step 0 时预测的 step 60 的 action
-      - chunk_1[30]: 模型在 step 30 时预测的 step 60 的 action  
-      - chunk_2[0]:  模型在 step 60 时预测的 step 60 的 action
-    
-    融合权重 (按 chunk 顺序索引，从旧到新):
-      weights = exp(-coeff * [0, 1, 2]) = [1.0, 0.99, 0.98] (coeff=0.01)
-      
-      归一化后: chunk_0 占 33.7%, chunk_1 占 33.3%, chunk_2 占 33.0%
-    
-    ==================== 权重解释 ====================
-    
-    索引 0 (最旧的 chunk) 权重最高的原因:
-    - 旧 chunk 在当前时间步的预测使用了 chunk 内更靠后的索引
-    - 例如 chunk_0[60] vs chunk_2[0]
-    - 模型对 "当前步" 的预测 (idx=0) vs "60步后" 的预测 (idx=60)
-    - 这种设计让多个预测结果平滑融合
-    
-    ==================== 参数调优 ====================
-    
-    temporal_ensemble_coeff 越大:
-      - 权重差异越大
-      - 更依赖旧的 chunk (更稳定的远期预测)
-      - 动作更平滑
-    
-    temporal_ensemble_coeff 越小 (趋近于 0):
-      - 权重趋于均匀
-      - 所有 chunk 权重相等
-      - 简单平均
-    
-    推荐值:
-      - 0.01: 标准设置，轻微倾向旧预测
-      - 0.1:  较强倾向旧预测，更平滑
-      - 0.0:  均匀权重，简单平均
-    """
-    
-    def __init__(
-        self,
-        chunk_size: int,
-        action_dim: int,
-        n_action_steps: int = 1,
-        temporal_ensemble_coeff: float = 0.01,
-        max_chunks: int = 0
-    ):
-        """
-        初始化 Temporal Ensemble Buffer
-        
-        Args:
-            chunk_size: 模型预测的 action chunk 大小
-            action_dim: action 维度
-            n_action_steps: 每隔多少步重新推理一次
-            temporal_ensemble_coeff: 指数衰减系数 (越大越重视新预测)
-            max_chunks: 最大缓存 chunk 数 (0 表示自动管理)
-        """
-        self.chunk_size = chunk_size
-        self.action_dim = action_dim
-        self.n_action_steps = n_action_steps
-        self.temporal_ensemble_coeff = temporal_ensemble_coeff
-        self.max_chunks = max_chunks if max_chunks > 0 else chunk_size
-        
-        # 存储 action chunks: 列表中每个元素是 {"chunk": np.ndarray, "start_step": int}
-        self.chunks: list = []
-        
-        # 当前全局时间步
-        self.global_step: int = 0
-        
-        # 上次推理的时间步
-        self.last_inference_step: int = -1
-        
-        logger.info(f"TemporalEnsembleBuffer 初始化:")
-        logger.info(f"  - chunk_size: {chunk_size}")
-        logger.info(f"  - action_dim: {action_dim}")
-        logger.info(f"  - n_action_steps: {n_action_steps}")
-        logger.info(f"  - temporal_ensemble_coeff: {temporal_ensemble_coeff}")
-    
-    def should_inference(self) -> bool:
-        """
-        是否需要进行新的推理
-        
-        Returns:
-            True 如果需要推理新的 chunk
-        """
-        # 第一次推理
-        if self.last_inference_step < 0:
-            return True
-        
-        # 每 n_action_steps 步推理一次
-        return self.global_step >= self.last_inference_step + self.n_action_steps
-    
-    def add_chunk(self, action_chunk: np.ndarray):
-        """
-        添加新的 action chunk
-        
-        Args:
-            action_chunk: shape (chunk_size, action_dim) 或 (action_dim,) 单步
-        """
-        # 处理各种维度情况
-        if action_chunk.ndim == 1:
-            # 单步 action (action_dim,) -> (1, action_dim)
-            action_chunk = action_chunk.reshape(1, -1)
-        elif action_chunk.ndim == 3:
-            # 带 batch 维度 (1, chunk_size, action_dim) -> (chunk_size, action_dim)
-            action_chunk = action_chunk.squeeze(0)
-        
-        # 验证维度
-        if action_chunk.ndim != 2:
-            logger.error(f"action_chunk 维度错误: {action_chunk.shape}, 期望 2D")
-            return
-        
-        logger.info(f"添加 chunk @ step {self.global_step}: shape={action_chunk.shape}")
-        
-        self.chunks.append({
-            "chunk": action_chunk,
-            "start_step": self.global_step
-        })
-        self.last_inference_step = self.global_step
-        
-        # 清理过期的 chunks
-        self._cleanup()
-        
-        logger.debug(f"当前缓存 {len(self.chunks)} 个 chunks")
-    
-    def _cleanup(self):
-        """清理不再需要的旧 chunks"""
-        valid_chunks = []
-        for item in self.chunks:
-            # 如果这个 chunk 还能覆盖当前或未来的时间步，保留它
-            end_step = item["start_step"] + len(item["chunk"]) - 1
-            if end_step >= self.global_step:
-                valid_chunks.append(item)
-        
-        # 限制最大 chunk 数量
-        if len(valid_chunks) > self.max_chunks:
-            valid_chunks = valid_chunks[-self.max_chunks:]
-        
-        self.chunks = valid_chunks
-    
-    def get_action(self) -> Optional[np.ndarray]:
-        """
-        获取当前时间步的融合 action
-        
-        参考 ACT 官方实现的 Temporal Ensemble 逻辑:
-        - 收集所有覆盖当前时间步的 chunk 预测
-        - 按 chunk 的顺序 (从旧到新) 分配权重: exp(-k * 0), exp(-k * 1), exp(-k * 2), ...
-        - 旧的 chunk (在列表前面) 权重更高 (因为它们在 chunk 内的索引更大，预测更远)
-        
-        Returns:
-            融合后的单步 action，如果没有可用的 chunk 返回 None
-        """
-        if not self.chunks:
-            return None
-        
-        actions = []
-        chunk_info = []  # 用于调试日志
-        
-        for item in self.chunks:
-            chunk = item["chunk"]
-            start_step = item["start_step"]
-            
-            # 计算当前全局时间步在这个 chunk 中的索引
-            idx = self.global_step - start_step
-            
-            if 0 <= idx < len(chunk):
-                actions.append(chunk[idx])
-                chunk_info.append(f"chunk@{start_step}[{idx}]")
-        
-        if not actions:
-            logger.warning(f"步骤 {self.global_step} 没有可用的 action")
-            return None
-        
-        n_actions = len(actions)
-        
-        if n_actions == 1:
-            # 只有一个 chunk，直接返回
-            if self.global_step % 20 == 0:
-                logger.info(f"TE @ step {self.global_step}: 使用单一 chunk {chunk_info[0]}")
-            return actions[0]
-        
-        # 多个 chunk 需要融合
-        # 按顺序索引计算权重: [exp(-k*0), exp(-k*1), exp(-k*2), ...]
-        # 索引 0 (最旧的 chunk) 权重最高
-        indices = np.arange(n_actions)
-        weights = np.exp(-self.temporal_ensemble_coeff * indices)
-        weights_normalized = weights / weights.sum()
-        
-        # 加权平均
-        actions_array = np.array(actions)  # (n_actions, action_dim)
-        action = np.sum(actions_array * weights_normalized[:, np.newaxis], axis=0)
-        
-        # 每 20 步打印详细日志
-        if self.global_step % 20 == 0:
-            logger.info(f"TE @ step {self.global_step}: 融合 {n_actions} 个 chunks (coeff={self.temporal_ensemble_coeff})")
-            for i, (info, w_raw, w_norm) in enumerate(zip(chunk_info, weights, weights_normalized)):
-                logger.info(f"  [{i}] {info} -> w_raw={w_raw:.4f}, w_norm={w_norm:.2%}")
-        
-        return action.astype(np.float32)
-    
-    def step(self):
-        """前进一个时间步"""
-        self.global_step += 1
-    
-    def reset(self):
-        """重置状态"""
-        self.chunks = []
-        self.global_step = 0
-        self.last_inference_step = -1
-        logger.debug("TemporalEnsembleBuffer 已重置")
-    
-    def get_remaining_steps(self) -> int:
-        """
-        获取当前 chunk 剩余可用步数
-        
-        Returns:
-            剩余步数，如果没有 chunk 返回 0
-        """
-        if not self.chunks:
-            return 0
-        
-        # 使用最新的 chunk
-        latest = self.chunks[-1]
-        remaining = latest["start_step"] + len(latest["chunk"]) - self.global_step
-        return max(0, remaining)
 
 
 # ============================================================================
@@ -517,7 +274,7 @@ class LeRobotModelInference:
     """
     LeRobot 模型推理器
     
-    直接复用 LeRobot 的推理逻辑
+    直接复用 LeRobot 的推理逻辑，使用 select_action 进行推理
     """
     
     def __init__(
@@ -603,7 +360,7 @@ class LeRobotModelInference:
     
     def predict(self, observation: Dict[str, Any]) -> np.ndarray:
         """
-        执行单步推理 (使用 select_action，内部处理 temporal ensemble)
+        执行单步推理 (使用 select_action)
         
         Args:
             observation: 观测字典
@@ -630,52 +387,6 @@ class LeRobotModelInference:
             action = action.squeeze()
         
         return action
-    
-    def predict_chunk(self, observation: Dict[str, Any]) -> np.ndarray:
-        """
-        预测完整的 action chunk (不使用 select_action 的内部 ensemble)
-        
-        Args:
-            observation: 观测字典
-            
-        Returns:
-            action chunk, shape: (chunk_size, action_dim)
-        """
-        if self.policy is None:
-            raise RuntimeError("模型未加载")
-        
-        obs_processed = self.preprocessor(observation)
-        
-        with torch.inference_mode():
-            # 使用 predict_action_chunk 获取完整 chunk
-            if hasattr(self.policy, 'predict_action_chunk'):
-                action_chunk = self.policy.predict_action_chunk(obs_processed)
-            else:
-                # 如果模型不支持 chunk 预测，fallback 到 select_action
-                action_chunk = self.policy.select_action(obs_processed)
-        
-        # 后处理
-        action_chunk = self.postprocessor(action_chunk)
-        
-        if isinstance(action_chunk, torch.Tensor):
-            action_chunk = action_chunk.cpu().numpy()
-        else:
-            action_chunk = np.array(action_chunk)
-        
-        # 确保是 2D: (chunk_size, action_dim)
-        # 处理各种可能的形状:
-        # - (action_dim,) -> (1, action_dim)
-        # - (chunk_size, action_dim) -> 保持不变
-        # - (1, chunk_size, action_dim) -> (chunk_size, action_dim) 移除 batch 维度
-        if action_chunk.ndim == 1:
-            action_chunk = action_chunk.reshape(1, -1)
-        elif action_chunk.ndim == 3:
-            # 移除 batch 维度 (1, chunk_size, action_dim) -> (chunk_size, action_dim)
-            action_chunk = action_chunk.squeeze(0)
-        
-        logger.debug(f"预测 action chunk: shape={action_chunk.shape}")
-        
-        return action_chunk
 
 
 # ============================================================================
@@ -683,14 +394,11 @@ class LeRobotModelInference:
 # ============================================================================
 class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
     """
-    LeRobot 推理服务实现 (精简版)
+    LeRobot 推理服务 gRPC 实现
     
-    配置方式: Server 以空闲模式启动，等待 Client 通过 Configure() 指定模型/数据集
-    
-    支持 Temporal Ensemble:
-    - 启用后，使用 predict_action_chunk 获取完整 action chunk
-    - 使用指数加权平均融合多个 chunk 的预测
-    - 可配置 n_action_steps 控制推理频率
+    支持两种模式:
+    1. model: 使用训练好的策略模型推理
+    2. dataset: 从数据集读取 action (用于回放/测试)
     """
     
     def __init__(self, config: ServerConfig):
@@ -705,31 +413,14 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         # Action 配置
         self.action_config = config.action_config
         
-        # Temporal Ensemble 配置
-        self.te_config = config.temporal_ensemble_config
-        self.te_buffer: Optional[TemporalEnsembleBuffer] = None
-        
         # 状态
         self.current_episode = 0
         self.current_frame = 0
         self.model_name = "none"
         
-        # 缓存最后的观测 (用于 temporal ensemble 需要重新推理时)
-        self._last_observation: Optional[Dict[str, Any]] = None
-        
         logger.info("Server 以空闲模式启动，等待 Client 配置...")
-        if self.te_config.enabled:
-            logger.info(f"Temporal Ensemble 已启用:")
-            logger.info(f"  - n_action_steps: {self.te_config.n_action_steps}")
-            logger.info(f"  - temporal_ensemble_coeff: {self.te_config.temporal_ensemble_coeff}")
     
-    def _load_model(
-        self, 
-        model_path: str, 
-        device: str = "cuda", 
-        policy_type: str = None,
-        te_config: Optional[TemporalEnsembleConfig] = None
-    ):
+    def _load_model(self, model_path: str, device: str = "cuda", policy_type: str = None):
         """加载模型"""
         logger.info(f"加载模型: {model_path} (device={device})")
         self.model_inference = LeRobotModelInference(
@@ -743,47 +434,7 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         self.is_ready = True
         self.current_frame = 0
         
-        # 如果指定了新的 temporal ensemble 配置，更新它
-        if te_config is not None:
-            self.te_config = te_config
-        
-        # 初始化 Temporal Ensemble Buffer (如果启用)
-        self._init_temporal_ensemble_buffer()
-        
         logger.info("模型加载成功")
-    
-    def _init_temporal_ensemble_buffer(self):
-        """初始化 Temporal Ensemble Buffer"""
-        self.te_buffer = None
-        
-        if not self.te_config.enabled:
-            logger.info("Temporal Ensemble 未启用，使用原始 select_action")
-            return
-        
-        if self.model_inference is None:
-            logger.warning("模型未加载，无法初始化 Temporal Ensemble")
-            return
-        
-        chunk_size = self.model_inference.chunk_size
-        action_dim = self.model_inference.action_dim
-        
-        if chunk_size <= 1:
-            logger.warning(f"模型 chunk_size={chunk_size}，Temporal Ensemble 无效，禁用")
-            self.te_config.enabled = False
-            return
-        
-        self.te_buffer = TemporalEnsembleBuffer(
-            chunk_size=chunk_size,
-            action_dim=action_dim,
-            n_action_steps=self.te_config.n_action_steps,
-            temporal_ensemble_coeff=self.te_config.temporal_ensemble_coeff,
-            max_chunks=self.te_config.max_chunks
-        )
-        
-        logger.info(f"Temporal Ensemble Buffer 已初始化:")
-        logger.info(f"  - chunk_size: {chunk_size}")
-        logger.info(f"  - action_dim: {action_dim}")
-        logger.info(f"  - n_action_steps: {self.te_config.n_action_steps}")
     
     def _load_dataset(self, dataset_path: str, action_config: Optional[ActionConfig] = None):
         """加载数据集"""
@@ -811,9 +462,6 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
             # 解析 action 配置
             action_config = self._parse_action_config(request)
             
-            # 解析 temporal ensemble 配置
-            te_config = self._parse_temporal_ensemble_config(request)
-            
             if request.mode == "model":
                 if not request.model_path:
                     return self._get_status("错误: 未指定 model_path")
@@ -824,13 +472,9 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
                 if action_config:
                     self.action_config = action_config
                 
-                self._load_model(request.model_path, device, policy_type, te_config)
+                self._load_model(request.model_path, device, policy_type)
                 
-                te_status = ""
-                if self.te_config.enabled and self.te_buffer:
-                    te_status = f", TE enabled (n_steps={self.te_config.n_action_steps})"
-                
-                return self._get_status(f"已加载模型: {request.model_path}{te_status}")
+                return self._get_status(f"已加载模型: {request.model_path}")
                 
             elif request.mode == "dataset":
                 if not request.dataset_path:
@@ -866,40 +510,6 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
                 execute_torso=ac.enable_torso if hasattr(ac, 'enable_torso') else True,
             )
         return None
-    
-    def _parse_temporal_ensemble_config(self, request: pb2.PolicyConfig) -> Optional[TemporalEnsembleConfig]:
-        """
-        解析 temporal ensemble 配置
-        
-        从 request.params 中解析:
-        - temporal_ensemble: "true"/"false" (是否启用)
-        - n_action_steps: "10" (每隔多少步推理)
-        - temporal_ensemble_coeff: "0.01" (指数衰减系数)
-        """
-        # 检查是否有 params 字段
-        if not hasattr(request, 'params'):
-            return None
-        
-        try:
-            params = dict(request.params) if request.params else {}
-        except Exception:
-            return None
-        
-        # 检查是否有 temporal ensemble 相关参数
-        if not any(k.startswith('temporal') or k == 'n_action_steps' for k in params):
-            return None
-        
-        enabled = params.get('temporal_ensemble', '').lower() in ('true', '1', 'yes')
-        n_action_steps = int(params.get('n_action_steps', str(self.te_config.n_action_steps)))
-        coeff = float(params.get('temporal_ensemble_coeff', str(self.te_config.temporal_ensemble_coeff)))
-        max_chunks = int(params.get('max_chunks', str(self.te_config.max_chunks)))
-        
-        return TemporalEnsembleConfig(
-            enabled=enabled,
-            n_action_steps=n_action_steps,
-            temporal_ensemble_coeff=coeff,
-            max_chunks=max_chunks
-        )
     
     def _build_observation_dict(self, request: pb2.Observation) -> Dict[str, Any]:
         """
@@ -988,12 +598,8 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         elif self.mode == "model":
             obs_dict = self._build_observation_dict(observation)
             
-            # 使用 Temporal Ensemble
-            if self.te_config.enabled and self.te_buffer is not None:
-                action = self._get_action_with_temporal_ensemble(obs_dict)
-            else:
-                # 原始方式: 直接使用 select_action
-                action = self.model_inference.predict(obs_dict)
+            # 直接使用 select_action 推理
+            action = self.model_inference.predict(obs_dict)
             
             # 根据配置过滤 action (传入当前状态)
             if action is not None and len(action) == LEROBOT_ACTION_DIM_WITH_CHASSIS:
@@ -1003,37 +609,6 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         
         else:
             return current_state if current_state is not None else np.zeros(LEROBOT_ACTION_DIM_NO_CHASSIS, dtype=np.float32)
-    
-    def _get_action_with_temporal_ensemble(self, obs_dict: Dict[str, Any]) -> Optional[np.ndarray]:
-        """
-        使用 Temporal Ensemble 获取 action
-        
-        Args:
-            obs_dict: 观测字典
-            
-        Returns:
-            融合后的单步 action
-        """
-        # 缓存观测 (用于可能需要的重新推理)
-        self._last_observation = obs_dict
-        
-        # 检查是否需要进行新的推理
-        if self.te_buffer.should_inference():
-            logger.debug(f"步骤 {self.te_buffer.global_step}: 执行新的 chunk 推理")
-            
-            # 预测完整的 action chunk
-            action_chunk = self.model_inference.predict_chunk(obs_dict)
-            
-            # 添加到 buffer
-            self.te_buffer.add_chunk(action_chunk)
-        
-        # 获取融合后的 action
-        action = self.te_buffer.get_action()
-        
-        # 前进一步
-        self.te_buffer.step()
-        
-        return action
     
     def _filter_action(self, action: np.ndarray, current_state: Optional[np.ndarray] = None) -> np.ndarray:
         """
@@ -1146,13 +721,9 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
     def _reset_state(self):
         """重置内部状态"""
         self.current_frame = 0
-        self._last_observation = None
         
         if self.model_inference:
             self.model_inference.reset()
-        
-        if self.te_buffer:
-            self.te_buffer.reset()
     
     def GetStatus(self, request: pb2.Empty, context) -> pb2.ServiceStatus:
         """获取状态"""
@@ -1171,11 +742,6 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         if self.mode == "dataset" and self.dataset_loader:
             total_frames = self.dataset_loader.get_episode_length(self.current_episode)
             fps = self.dataset_loader.get_fps()
-        
-        # 添加 Temporal Ensemble 状态到 message
-        if self.te_config.enabled and self.te_buffer and not message:
-            te_info = f"TE: n_steps={self.te_config.n_action_steps}, step={self.te_buffer.global_step}"
-            message = te_info
         
         return pb2.ServiceStatus(
             is_ready=self.is_ready,
@@ -1278,13 +844,6 @@ def main():
   
   # 指定设备
   python inference_server.py --port 50051 --device cuda:0
-  
-  # 启用 Temporal Ensemble (每 10 步推理一次)
-  python inference_server.py --port 50051 --temporal-ensemble --n-action-steps 10
-  
-  # 自定义 Temporal Ensemble 参数
-  python inference_server.py --port 50051 --temporal-ensemble \\
-      --n-action-steps 5 --te-coeff 0.02
         """
     )
     
@@ -1294,33 +853,14 @@ def main():
     parser.add_argument('--workers', type=int, default=10, help='工作线程数 (默认: 10)')
     parser.add_argument('--fps', type=float, default=30.0, help='目标帧率 (默认: 30)')
     
-    # Temporal Ensemble 参数
-    parser.add_argument('--temporal-ensemble', action='store_true',
-                        help='启用 Temporal Ensemble (默认: 禁用)')
-    parser.add_argument('--n-action-steps', type=int, default=1,
-                        help='每隔多少步重新推理一次 (默认: 1，即每步推理)')
-    parser.add_argument('--te-coeff', type=float, default=0.01,
-                        help='Temporal Ensemble 指数衰减系数 (默认: 0.01)')
-    parser.add_argument('--max-chunks', type=int, default=0,
-                        help='最大缓存 chunk 数量 (默认: 0，自动管理)')
-    
     args = parser.parse_args()
-    
-    # 构建 Temporal Ensemble 配置
-    te_config = TemporalEnsembleConfig(
-        enabled=args.temporal_ensemble,
-        n_action_steps=args.n_action_steps,
-        temporal_ensemble_coeff=args.te_coeff,
-        max_chunks=args.max_chunks
-    )
     
     config = ServerConfig(
         host=args.host,
         port=args.port,
         max_workers=args.workers,
         device=args.device,
-        fps=args.fps,
-        temporal_ensemble_config=te_config
+        fps=args.fps
     )
     
     run_server(config)

@@ -855,20 +855,33 @@ def run_inference_loop(
     logger.info(f"服务状态: {'就绪' if status.is_ready else '未就绪'}")
     logger.info(f"模式: {status.mode}, 总帧数: {total_frames}")
     
+    # ==================== 等待图像就绪 ====================
+    if controller._enable_camera and controller.camera_subscriber:
+        logger.info("等待相机图像就绪...")
+        if controller.camera_subscriber.wait_for_images(timeout=10.0):
+            logger.info("所有相机图像已就绪")
+        else:
+            logger.warning("部分相机图像未就绪，继续执行...")
+    
     # ==================== 阶段1: 路径规划 ====================
     if planning_frames > 0:
         logger.info(f"=== 阶段1: 路径规划 ({planning_frames} 帧) ===")
         
         planning_actions = []
         for i in range(planning_frames):
+            # 获取图像 (如果启用相机)
+            images = controller.get_current_images()
+            
             response = controller.inference_client.predict(
                 joint_positions=controller.get_current_joint_positions(),
+                images=images,
                 episode_id=episode,
                 frame_index=i
             )
             if response.status == pb2.OK:
                 planning_actions.append(list(response.values))
             else:
+                logger.warning(f"路径规划帧 {i} 失败: {response.error_message}")
                 break
         
         if planning_actions:

@@ -185,8 +185,12 @@ def waypoint_to_lerobot_action(waypoint: List[List[float]], include_chassis: boo
     # V2.0 格式: [arm_left, arm_right, gripper_left, gripper_right, head, torso, chassis?]
     action = arm_left + arm_right + gripper_left + gripper_right + head + torso
     
-    if include_chassis and len(waypoint) > 6:
-        chassis = waypoint[6]  # 3
+    if include_chassis:
+        if len(waypoint) > 6:
+            chassis = waypoint[6]  # 3
+        else:
+            # waypoint 没有底盘数据，补零
+            chassis = [0.0, 0.0, 0.0]
         action = action + chassis
     
     return action

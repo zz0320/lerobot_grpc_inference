@@ -48,7 +48,9 @@ from src.common.constants import (
     LEROBOT_ACTION_DIM,
     LEROBOT_ACTION_DIM_NO_CHASSIS,
     LEROBOT_ACTION_DIM_WITH_CHASSIS,
-    GRPC_MAX_MESSAGE_LENGTH
+    GRPC_MAX_MESSAGE_LENGTH,
+    READY_POSITION_22,
+    READY_POSITION_25,
 )
 
 # Astribot SDK
@@ -638,9 +640,11 @@ class AstribotController:
             self.astribot.move_to_home()
         logger.info("已到达 home 位置")
     
-    def move_to_initial_position(self, duration: float = 3.0) -> bool:
+    def move_to_ready_position(self, duration: float = 5.0) -> bool:
         """
-        使用路径规划移动到初始位置
+        使用路径规划移动到预设的准备位置 (Ready Position)
+        
+        准备位置定义在 constants.py 中的 READY_POSITION_22/25
         
         Args:
             duration: 移动时间 (秒)
@@ -648,46 +652,51 @@ class AstribotController:
         Returns:
             是否成功
         """
-        response = self.inference_client.predict(
-            joint_positions=self.get_current_joint_positions(),
-            episode_id=self._episode_id,
-            frame_index=0
-        )
+        logger.info("=" * 60)
+        logger.info("阶段1: 移动到准备位置 (Ready Position)")
+        logger.info("=" * 60)
         
-        if response.status != pb2.OK:
-            logger.error(f"获取初始位置失败: {response.error_message}")
-            return False
+        # 选择准备位置 (根据是否控制底盘)
+        if self._execute_chassis:
+            ready_position = READY_POSITION_25
+            logger.info("使用 25 维准备位置 (含底盘)")
+        else:
+            ready_position = READY_POSITION_22
+            logger.info("使用 22 维准备位置 (不含底盘)")
         
-        action = list(response.values)
+        logger.info(f"目标位置 (前5维): {ready_position[:5]}")
+        logger.info(f"规划时间: {duration}s")
         
-        # 判断 action 是否包含底盘维度 (模型/数据集输出)
-        action_has_chassis = len(action) >= LEROBOT_ACTION_DIM_WITH_CHASSIS
-        
-        logger.info(f"移动到初始位置 (耗时 {duration}s)...")
-        logger.info(f"  - Action 维度: {len(action)} (含底盘: {action_has_chassis})")
-        logger.info(f"  - 执行底盘控制: {self._execute_chassis}")
-        
-        # 转换为 waypoint (根据 execute_chassis 决定是否包含底盘)
-        # 如果 action 有底盘但不执行底盘，则截断; 如果 action 没有底盘但要执行，则补零
+        # 转换为 waypoint
         waypoint = lerobot_action_to_waypoint(
-            action, 
-            include_chassis=self._execute_chassis  # 执行时是否控制底盘
+            ready_position, 
+            include_chassis=self._execute_chassis
         )
         
+        # 执行路径规划
         if self.astribot:
+            logger.info("开始路径规划移动...")
             self.astribot.move_joints_waypoints(
-                self._get_names_list(),  # 使用 _execute_chassis 决定的列表
+                self._get_names_list(),
                 [waypoint],
                 [duration],
                 use_wbc=self._use_wbc
             )
         else:
+            logger.info(f"模拟模式: 等待 {duration}s...")
             time.sleep(duration)
         
         self._current_waypoint = waypoint
-        self._frame_index = 1
-        logger.info("已到达初始位置")
+        
+        logger.info("✓ 已到达准备位置")
+        logger.info("=" * 60)
         return True
+    
+    def move_to_initial_position(self, duration: float = 3.0) -> bool:
+        """
+        [已弃用] 使用 move_to_ready_position 代替
+        """
+        return self.move_to_ready_position(duration)
     
     def move_waypoints(
         self, 
@@ -823,26 +832,34 @@ class AstribotController:
 def run_inference_loop(
     controller: AstribotController,
     episode: int = 0,
-    planning_frames: int = 5,
-    planning_duration: float = 3.0,
-    max_frames: int = 10000
+    max_frames: int = 10000,
+    move_to_ready: bool = True,
+    ready_move_duration: float = 5.0
 ):
     """
-    运行推理控制循环 (两阶段: 路径规划 + 实时控制)
+    运行推理控制循环 (两阶段: 移动到准备位置 + 实时推理)
+    
+    阶段1: 移动到准备位置 (Ready Position)
+        - 使用路径规划移动到预设的固定位置
+        - 准备位置定义在 constants.py
+    
+    阶段2: 实时推理控制
+        - 从 frame_index=0 开始推理
+        - 按控制频率执行
     
     Args:
         controller: 控制器
         episode: episode 索引
-        planning_frames: 前几帧使用路径规划
-        planning_duration: 路径规划的总时间
         max_frames: 最大帧数
+        move_to_ready: 是否先移动到准备位置
+        ready_move_duration: 移动到准备位置的时间 (秒)
     """
     global _interrupted
     _interrupted = False
     
     logger.info("=" * 60)
     logger.info(f"开始推理控制 (episode={episode})")
-    logger.info(f"  - 前 {planning_frames} 帧: 路径规划")
+    logger.info(f"  - 移动到准备位置: {move_to_ready} ({ready_move_duration}s)")
     logger.info(f"  - 控制频率: {controller.control_freq} Hz")
     logger.info("=" * 60)
     
@@ -863,54 +880,30 @@ def run_inference_loop(
         else:
             logger.warning("部分相机图像未就绪，继续执行...")
     
-    # ==================== 阶段1: 路径规划 ====================
-    if planning_frames > 0:
-        logger.info(f"=== 阶段1: 路径规划 ({planning_frames} 帧) ===")
+    # ==================== 阶段1: 移动到准备位置 ====================
+    if move_to_ready:
+        if not controller.move_to_ready_position(duration=ready_move_duration):
+            logger.error("移动到准备位置失败，中止推理")
+            return
         
-        planning_actions = []
-        for i in range(planning_frames):
-            # 获取图像 (如果启用相机)
-            images = controller.get_current_images()
-            
-            response = controller.inference_client.predict(
-                joint_positions=controller.get_current_joint_positions(),
-                images=images,
-                episode_id=episode,
-                frame_index=i
-            )
-            if response.status == pb2.OK:
-                planning_actions.append(list(response.values))
-            else:
-                logger.warning(f"路径规划帧 {i} 失败: {response.error_message}")
-                break
-        
-        if planning_actions:
-            time_per_frame = planning_duration / len(planning_actions)
-            time_list = [time_per_frame * (i + 1) for i in range(len(planning_actions))]
-            
-            controller.move_waypoints(planning_actions, time_list)
-            controller._frame_index = len(planning_actions)
+        if _interrupted:
+            logger.warning("用户中断")
+            return
     
-    if _interrupted:
-        logger.warning("用户中断")
-        return
+    # ==================== 阶段2: 实时推理控制 ====================
+    logger.info("=" * 60)
+    logger.info(f"阶段2: 实时推理控制 ({total_frames} 帧 @ {controller.control_freq}Hz)")
+    logger.info("=" * 60)
     
-    # ==================== 阶段2: 实时控制 ====================
-    realtime_start = controller._frame_index
-    realtime_count = total_frames - realtime_start
-    
-    if realtime_count <= 0:
-        logger.info("回放完成! (全部使用路径规划)")
-        return
-    
-    logger.info(f"=== 阶段2: 实时控制 ({realtime_count} 帧 @ {controller.control_freq}Hz) ===")
+    # 从 frame_index=0 开始
+    controller._frame_index = 0
     
     control_period = controller.control_period
     
     start_time = time.time()
     frame_count = 0
     
-    while not _interrupted and frame_count < realtime_count:
+    while not _interrupted and frame_count < total_frames:
         loop_start = time.time()
         
         if not controller.step():
@@ -923,8 +916,8 @@ def run_inference_loop(
         if frame_count % 100 == 0:
             elapsed = time.time() - start_time
             actual_freq = frame_count / elapsed if elapsed > 0 else 0
-            progress = (realtime_start + frame_count) / total_frames * 100
-            logger.info(f"进度: {realtime_start + frame_count}/{total_frames} "
+            progress = frame_count / total_frames * 100
+            logger.info(f"进度: {frame_count}/{total_frames} "
                        f"({progress:.1f}%) | 实际频率: {actual_freq:.1f}Hz")
         
         # 频率控制
@@ -933,8 +926,9 @@ def run_inference_loop(
             time.sleep(control_period - elapsed)
     
     total_time = time.time() - start_time
-    logger.info(f"实时控制完成! 帧数: {frame_count}, 耗时: {total_time:.2f}s, "
-               f"平均频率: {frame_count/total_time:.1f}Hz")
+    if frame_count > 0:
+        logger.info(f"推理完成! 帧数: {frame_count}, 耗时: {total_time:.2f}s, "
+                   f"平均频率: {frame_count/total_time:.1f}Hz")
 
 
 def main():
@@ -1011,14 +1005,18 @@ def main():
     parser.add_argument('--control-way', type=str, default='direct',
                         choices=['filter', 'direct'],
                         help='控制方式 (默认: direct)')
-    parser.add_argument('--planning-frames', type=int, default=5,
-                        help='前几帧使用路径规划 (默认: 5)')
-    parser.add_argument('--planning-duration', type=float, default=3.0,
-                        help='路径规划的总时间 (默认: 3.0s)')
     parser.add_argument('--smooth', type=int, default=0,
                         help='平滑窗口大小 (0=不平滑)')
     parser.add_argument('--max-velocity', type=float, default=0.0,
                         help='最大速度 rad/frame (0=不限制)')
+    
+    # 准备位置配置
+    parser.add_argument('--move-to-ready', action='store_true', default=True,
+                        help='启动时先移动到准备位置 (默认: 开启)')
+    parser.add_argument('--no-move-to-ready', action='store_true',
+                        help='禁用移动到准备位置，直接开始推理')
+    parser.add_argument('--ready-duration', type=float, default=5.0,
+                        help='移动到准备位置的时间 (默认: 5.0s)')
     
     args = parser.parse_args()
     
@@ -1053,8 +1051,6 @@ def main():
         control_way=args.control_way,
         smooth_window=args.smooth,
         max_velocity=args.max_velocity,
-        planning_frames=args.planning_frames,
-        planning_duration=args.planning_duration,
         action_config=action_config
     )
     
@@ -1062,6 +1058,9 @@ def main():
     
     # 解析相机列表
     camera_names = [c.strip() for c in args.cameras.split(',') if c.strip()]
+    
+    # 是否移动到准备位置
+    move_to_ready = args.move_to_ready and not args.no_move_to_ready
     
     try:
         controller = AstribotController(
@@ -1073,9 +1072,9 @@ def main():
         run_inference_loop(
             controller,
             episode=args.episode,
-            planning_frames=config.planning_frames,
-            planning_duration=config.planning_duration,
-            max_frames=args.max_frames
+            max_frames=args.max_frames,
+            move_to_ready=move_to_ready,
+            ready_move_duration=args.ready_duration
         )
         
         if not _interrupted:

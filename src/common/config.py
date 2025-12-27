@@ -129,10 +129,6 @@ class ClientConfig:
     smooth_window: int = 0  # 0 = 不平滑
     max_velocity: float = 0.0  # 0 = 不限制
     
-    # 规划配置
-    planning_frames: int = 5
-    planning_duration: float = 3.0
-    
     # Action 配置
     action_config: ActionConfig = field(default_factory=ActionConfig)
     

@@ -109,3 +109,32 @@ DEFAULT_GRPC_HOST = "0.0.0.0"
 GRPC_MAX_MESSAGE_LENGTH = 50 * 1024 * 1024  # 50MB
 GRPC_KEEPALIVE_TIME_MS = 10000
 GRPC_KEEPALIVE_TIMEOUT_MS = 5000
+
+# ============================================================================
+# 机器人准备位置 (Ready Position)
+# 推理开始前会先移动到这个位置
+# ============================================================================
+
+# 22维准备位置 (不含底盘)
+# 格式: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), head(2), torso(4)]
+READY_POSITION_22 = [
+    # arm_left (7)
+    0.166934, -0.0208335, -1.42195, 1.66656, -0.349673, 0.113146, 0.124149,
+    # arm_right (7)
+    -0.171689, -0.0271618, 1.42155, 1.66481, 0.351032, 0.110436, -0.126622,
+    # gripper_left (1)
+    -0.21514,
+    # gripper_right (1)
+    -0.178489,
+    # head (2)
+    0.000243169, 0.778388,
+    # torso (4)
+    0.593704, -1.19625, 0.59604, 0.0133035,
+]
+
+# 25维准备位置 (含底盘)
+# 格式: [arm_left(7), arm_right(7), gripper_left(1), gripper_right(1), head(2), torso(4), chassis(3)]
+READY_POSITION_25 = READY_POSITION_22 + [
+    # chassis (3)
+    -0.0345618, 0.00303842, -0.0927529,
+]

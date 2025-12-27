@@ -96,34 +96,45 @@ class TemporalEnsembleBuffer:
     - 缓存多个 action chunk 的预测
     - 使用指数加权平均融合当前时间步的 actions
     
-    工作原理:
-    - 假设 chunk_size = 100, n_action_steps = 10
-    - 在时间步 0，模型预测 chunk_0 = [a0_0, a0_1, ..., a0_99]
-    - 时间步 0-9 使用 chunk_0 中的对应位置
-    - 在时间步 10，模型预测 chunk_1 = [a1_0, a1_1, ..., a1_99]
-    - 时间步 10 时，融合 chunk_0[10] 和 chunk_1[0]
-    - 权重使用指数衰减: w = exp(-coeff * age)
+    ==================== 核心逻辑 ====================
     
-    Example:
-        >>> buffer = TemporalEnsembleBuffer(
-        ...     chunk_size=100,
-        ...     action_dim=22,
-        ...     n_action_steps=10,
-        ...     temporal_ensemble_coeff=0.01
-        ... )
-        >>> 
-        >>> # 第一次推理
-        >>> action_chunk = model.predict_chunk(obs)  # shape: (100, 22)
-        >>> buffer.add_chunk(action_chunk)
-        >>> 
-        >>> # 获取融合后的 action
-        >>> for step in range(100):
-        ...     if buffer.should_inference():
-        ...         new_chunk = model.predict_chunk(obs)
-        ...         buffer.add_chunk(new_chunk)
-        ...     action = buffer.get_action()
-        ...     robot.execute(action)
-        ...     buffer.step()
+    假设 chunk_size=100, n_action_steps=10:
+    
+    Step 0:  预测 chunk_0，chunk_0[0..99] 对应 step 0..99
+    Step 10: 预测 chunk_1，chunk_1[0..99] 对应 step 10..109
+    Step 20: 预测 chunk_2，chunk_2[0..99] 对应 step 20..119
+    
+    在 Step 15 时，有两个 chunk 覆盖:
+      - chunk_0[15]: 这个预测在 15 步之前做出 (chunk 年龄 = 15)
+      - chunk_1[5]:  这个预测在 5 步之前做出 (chunk 年龄 = 5)
+    
+    融合权重: w = exp(-coeff * chunk_age)
+      - chunk_1 的 age=5，权重 = exp(-0.01 * 5) = 0.951
+      - chunk_0 的 age=15，权重 = exp(-0.01 * 15) = 0.861
+      - 归一化后: chunk_1 占比 52.5%, chunk_0 占比 47.5%
+    
+    注意: chunk_age = global_step - start_step = idx (在 chunk 内的位置)
+    
+    这意味着: 
+    - 越新预测的 chunk，权重越高（因为基于最新观测）
+    - 等价地：chunk 内靠前的 action 权重更高
+    
+    ==================== 参数调优 ====================
+    
+    temporal_ensemble_coeff 越大:
+      - 权重衰减越快
+      - 更依赖最新的预测
+      - 响应更快但可能抖动
+    
+    temporal_ensemble_coeff 越小:
+      - 权重衰减越慢
+      - 更多历史预测参与融合
+      - 更平滑但响应较慢
+    
+    推荐值:
+      - 0.01: 标准设置，平滑与响应的平衡
+      - 0.1:  快速响应，适合需要即时反应的任务
+      - 0.001: 超平滑，适合缓慢精细操作
     """
     
     def __init__(
@@ -186,9 +197,20 @@ class TemporalEnsembleBuffer:
         Args:
             action_chunk: shape (chunk_size, action_dim) 或 (action_dim,) 单步
         """
-        # 处理单步 action (兼容非 chunking 模型)
+        # 处理各种维度情况
         if action_chunk.ndim == 1:
+            # 单步 action (action_dim,) -> (1, action_dim)
             action_chunk = action_chunk.reshape(1, -1)
+        elif action_chunk.ndim == 3:
+            # 带 batch 维度 (1, chunk_size, action_dim) -> (chunk_size, action_dim)
+            action_chunk = action_chunk.squeeze(0)
+        
+        # 验证维度
+        if action_chunk.ndim != 2:
+            logger.error(f"action_chunk 维度错误: {action_chunk.shape}, 期望 2D")
+            return
+        
+        logger.info(f"添加 chunk @ step {self.global_step}: shape={action_chunk.shape}")
         
         self.chunks.append({
             "chunk": action_chunk,
@@ -199,7 +221,7 @@ class TemporalEnsembleBuffer:
         # 清理过期的 chunks
         self._cleanup()
         
-        logger.debug(f"添加 chunk @ step {self.global_step}, 当前缓存 {len(self.chunks)} 个 chunks")
+        logger.debug(f"当前缓存 {len(self.chunks)} 个 chunks")
     
     def _cleanup(self):
         """清理不再需要的旧 chunks"""
@@ -220,6 +242,11 @@ class TemporalEnsembleBuffer:
         """
         获取当前时间步的融合 action
         
+        ACT Temporal Ensemble 逻辑:
+        - 多个 chunk 可能覆盖当前时间步
+        - 越新预测的 chunk（age 越小），权重越高
+        - age = global_step - start_step (chunk 是多少步之前预测的)
+        
         Returns:
             融合后的单步 action，如果没有可用的 chunk 返回 None
         """
@@ -228,6 +255,7 @@ class TemporalEnsembleBuffer:
         
         actions = []
         weights = []
+        chunk_info = []  # 用于调试日志
         
         for item in self.chunks:
             chunk = item["chunk"]
@@ -239,11 +267,13 @@ class TemporalEnsembleBuffer:
             if 0 <= idx < len(chunk):
                 actions.append(chunk[idx])
                 
-                # 权重: 基于 chunk 的"年龄"（当前步 - chunk 开始步）
-                # age = 0 表示这是这个 chunk 的第一步
-                age = idx
-                weight = np.exp(-self.temporal_ensemble_coeff * age)
+                # 权重: 基于 chunk 的"年龄"（chunk 是多少步之前预测的）
+                # age = 0 表示这个 chunk 是刚刚预测的（最新的）
+                # age 越大说明 chunk 越老，权重越低
+                chunk_age = self.global_step - start_step
+                weight = np.exp(-self.temporal_ensemble_coeff * chunk_age)
                 weights.append(weight)
+                chunk_info.append(f"chunk@{start_step}[{idx}],age={chunk_age}")
         
         if not actions:
             logger.warning(f"步骤 {self.global_step} 没有可用的 action")
@@ -251,14 +281,18 @@ class TemporalEnsembleBuffer:
         
         # 归一化权重
         weights = np.array(weights, dtype=np.float32)
-        weights = weights / weights.sum()
+        weights_normalized = weights / weights.sum()
         
         # 加权平均
         action = np.zeros(self.action_dim, dtype=np.float32)
-        for w, a in zip(weights, actions):
+        for w, a in zip(weights_normalized, actions):
             action += w * a
         
-        logger.debug(f"步骤 {self.global_step}: 融合 {len(actions)} 个 actions, 权重: {weights}")
+        # 每 20 步或有多个 chunk 融合时打印详细日志
+        if self.global_step % 20 == 0 or len(actions) > 1:
+            logger.info(f"TE @ step {self.global_step}: 融合 {len(actions)} 个 chunks")
+            for i, (info, w_raw, w_norm) in enumerate(zip(chunk_info, weights, weights_normalized)):
+                logger.info(f"  [{i}] {info} -> w_raw={w_raw:.4f}, w_norm={w_norm:.2%}")
         
         return action
     
@@ -624,8 +658,15 @@ class LeRobotModelInference:
             action_chunk = np.array(action_chunk)
         
         # 确保是 2D: (chunk_size, action_dim)
+        # 处理各种可能的形状:
+        # - (action_dim,) -> (1, action_dim)
+        # - (chunk_size, action_dim) -> 保持不变
+        # - (1, chunk_size, action_dim) -> (chunk_size, action_dim) 移除 batch 维度
         if action_chunk.ndim == 1:
             action_chunk = action_chunk.reshape(1, -1)
+        elif action_chunk.ndim == 3:
+            # 移除 batch 维度 (1, chunk_size, action_dim) -> (chunk_size, action_dim)
+            action_chunk = action_chunk.squeeze(0)
         
         logger.debug(f"预测 action chunk: shape={action_chunk.shape}")
         
@@ -926,6 +967,11 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
     
     def _get_action(self, observation: pb2.Observation) -> Optional[np.ndarray]:
         """获取 action"""
+        # 获取当前状态 (用于禁用部件时保持原值)
+        current_state = None
+        if observation.joint_positions:
+            current_state = np.array(observation.joint_positions, dtype=np.float32)
+        
         if self.mode == "dataset":
             action = self.dataset_loader.get_action(
                 observation.episode_id,
@@ -944,14 +990,14 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
                 # 原始方式: 直接使用 select_action
                 action = self.model_inference.predict(obs_dict)
             
-            # 根据配置过滤 action
+            # 根据配置过滤 action (传入当前状态)
             if action is not None and len(action) == LEROBOT_ACTION_DIM_WITH_CHASSIS:
-                action = self._filter_action(action)
+                action = self._filter_action(action, current_state)
             
             return action
         
         else:
-            return np.array(observation.joint_positions, dtype=np.float32)
+            return current_state if current_state is not None else np.zeros(LEROBOT_ACTION_DIM_NO_CHASSIS, dtype=np.float32)
     
     def _get_action_with_temporal_ensemble(self, obs_dict: Dict[str, Any]) -> Optional[np.ndarray]:
         """
@@ -984,24 +1030,41 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         
         return action
     
-    def _filter_action(self, action: np.ndarray) -> np.ndarray:
-        """根据 action 配置过滤 action"""
+    def _filter_action(self, action: np.ndarray, current_state: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+        根据 action 配置过滤 action
+        
+        注意: 为了保持维度一致性，禁用的部件不会被移除，而是保持当前值（不变）
+        这样 Client 端始终收到 22 或 25 维的 action
+        
+        Args:
+            action: 原始 action (25维)
+            current_state: 当前状态 (可选，用于保持禁用部件的值)
+        """
         if len(action) != LEROBOT_ACTION_DIM_WITH_CHASSIS:
             return action
         
-        parts = []
-        parts.append(action[0:16])
+        filtered = action.copy()
         
-        if self.action_config.enable_head:
-            parts.append(action[16:18])
+        # 如果禁用头部，保持头部不变 (设为 0 或当前值)
+        if not self.action_config.enable_head:
+            if current_state is not None and len(current_state) >= 18:
+                filtered[16:18] = current_state[16:18]
+            else:
+                filtered[16:18] = 0.0
         
-        if self.action_config.enable_torso:
-            parts.append(action[18:22])
+        # 如果禁用腰部，保持腰部不变
+        if not self.action_config.enable_torso:
+            if current_state is not None and len(current_state) >= 22:
+                filtered[18:22] = current_state[18:22]
+            else:
+                filtered[18:22] = 0.0
         
+        # 根据是否执行底盘决定输出维度
         if self.action_config.enable_chassis:
-            parts.append(action[22:25])
-        
-        return np.concatenate(parts)
+            return filtered  # 25 维
+        else:
+            return filtered[:22]  # 22 维 (移除底盘)
     
     def Predict(self, request: pb2.Observation, context) -> pb2.Action:
         """单次推理"""

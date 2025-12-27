@@ -387,6 +387,53 @@ class LeRobotModelInference:
             action = action.squeeze()
         
         return action
+    
+    def predict_chunk(self, observation: Dict[str, Any]) -> np.ndarray:
+        """
+        执行 chunk 推理 (使用 predict_action_chunk)
+        
+        一次性返回完整的 action chunk，不经过内部 action queue
+        
+        Args:
+            observation: 观测字典
+            
+        Returns:
+            action chunk: shape (chunk_size, action_dim)
+        """
+        if self.policy is None:
+            raise RuntimeError("模型未加载")
+        
+        obs_processed = self.preprocessor(observation)
+        
+        with torch.inference_mode():
+            # 直接调用 predict_action_chunk 获取完整 chunk
+            if hasattr(self.policy, 'predict_action_chunk'):
+                action_chunk_tensor = self.policy.predict_action_chunk(obs_processed)
+            else:
+                # 如果策略不支持 chunk，回退到 select_action
+                action_tensor = self.policy.select_action(obs_processed)
+                action_chunk_tensor = action_tensor.unsqueeze(1) if action_tensor.ndim == 2 else action_tensor.unsqueeze(0).unsqueeze(0)
+        
+        # 后处理每个 action
+        # predict_action_chunk 返回 (batch, chunk_size, action_dim)
+        if action_chunk_tensor.ndim == 3:
+            # 逐个处理每个 action step
+            actions = []
+            for i in range(action_chunk_tensor.shape[1]):
+                step_action = action_chunk_tensor[:, i, :]  # (batch, action_dim)
+                step_action = self.postprocessor(step_action)
+                if isinstance(step_action, torch.Tensor):
+                    step_action = step_action.cpu().numpy()
+                actions.append(step_action.squeeze())
+            return np.stack(actions, axis=0)  # (chunk_size, action_dim)
+        else:
+            # 2D tensor: (batch, action_dim)
+            action_tensor = self.postprocessor(action_chunk_tensor)
+            if isinstance(action_tensor, torch.Tensor):
+                action = action_tensor.cpu().numpy()
+            else:
+                action = np.array(action_tensor)
+            return action.reshape(1, -1)  # (1, action_dim)
 
 
 # ============================================================================
@@ -680,6 +727,115 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
                 status=pb2.ERROR,
                 error_message=str(e)
             )
+    
+    def PredictChunk(self, request: pb2.Observation, context) -> pb2.ActionChunk:
+        """
+        Chunk 推理 - 一次性返回完整的 action chunk
+        
+        适用于 action chunking 策略 (ACT, Diffusion 等)
+        Client 端在本地消费 chunk，用完后再请求新的
+        """
+        if not self.is_ready:
+            return pb2.ActionChunk(
+                status=pb2.NOT_READY,
+                error_message="服务未就绪，请先调用 Configure"
+            )
+        
+        try:
+            action_chunk = self._get_action_chunk(request)
+            
+            if action_chunk is None:
+                return pb2.ActionChunk(
+                    status=pb2.EPISODE_END,
+                    is_terminal=True
+                )
+            
+            # action_chunk shape: (chunk_size, action_dim)
+            chunk_size = action_chunk.shape[0]
+            action_dim = action_chunk.shape[1] if action_chunk.ndim > 1 else len(action_chunk)
+            
+            # 构建响应
+            action_steps = []
+            for i in range(chunk_size):
+                step_values = action_chunk[i].tolist() if action_chunk.ndim > 1 else action_chunk.tolist()
+                action_steps.append(pb2.ActionStep(values=step_values))
+            
+            self.current_frame = request.frame_index + chunk_size
+            
+            logger.debug(f"返回 action chunk: size={chunk_size}, dim={action_dim}")
+            
+            return pb2.ActionChunk(
+                actions=action_steps,
+                chunk_size=chunk_size,
+                action_dim=action_dim,
+                is_terminal=False,
+                status=pb2.OK,
+                server_frame_index=request.frame_index
+            )
+            
+        except Exception as e:
+            logger.error(f"Chunk 推理错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return pb2.ActionChunk(
+                status=pb2.ERROR,
+                error_message=str(e)
+            )
+    
+    def _get_action_chunk(self, observation: pb2.Observation) -> Optional[np.ndarray]:
+        """
+        获取完整的 action chunk
+        
+        Returns:
+            action chunk: shape (chunk_size, action_dim)
+        """
+        # 获取当前状态 (用于禁用部件时保持原值)
+        current_state = None
+        if observation.joint_positions:
+            current_state = np.array(observation.joint_positions, dtype=np.float32)
+        
+        if self.mode == "dataset":
+            # 数据集模式: 返回从当前帧开始的多个 action
+            actions = []
+            frame_start = observation.frame_index
+            chunk_size = 100  # 默认 chunk 大小
+            
+            for i in range(chunk_size):
+                action = self.dataset_loader.get_action(
+                    observation.episode_id,
+                    frame_start + i,
+                    action_config=self.action_config
+                )
+                if action is None:
+                    break
+                actions.append(action)
+            
+            if not actions:
+                return None
+            return np.stack(actions, axis=0)
+            
+        elif self.mode == "model":
+            # 模型模式: 使用 predict_chunk 获取完整 chunk
+            obs_dict = self._build_observation_dict(observation)
+            
+            # 直接使用 predict_chunk 推理
+            action_chunk = self.model_inference.predict_chunk(obs_dict)
+            
+            # 根据配置过滤每个 action
+            if action_chunk is not None and action_chunk.shape[-1] == LEROBOT_ACTION_DIM_WITH_CHASSIS:
+                filtered_actions = []
+                for i in range(action_chunk.shape[0]):
+                    filtered = self._filter_action(action_chunk[i], current_state)
+                    filtered_actions.append(filtered)
+                action_chunk = np.stack(filtered_actions, axis=0)
+            
+            return action_chunk
+        
+        else:
+            # 未配置模式
+            if current_state is not None:
+                return current_state.reshape(1, -1)
+            return np.zeros((1, LEROBOT_ACTION_DIM_NO_CHASSIS), dtype=np.float32)
     
     def StreamPredict(
         self,

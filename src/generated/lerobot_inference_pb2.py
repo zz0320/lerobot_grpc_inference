@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17lerobot_inference.proto\x12\x07lerobot\"\x9b\x01\n\x0bObservation\x12\x17\n\x0fjoint_positions\x18\x01 \x03(\x02\x12\"\n\x06images\x18\x02 \x03(\x0b\x32\x12.lerobot.ImageData\x12\x11\n\ttimestamp\x18\x03 \x01(\x01\x12\x12\n\nepisode_id\x18\x04 \x01(\x05\x12\x13\n\x0b\x66rame_index\x18\x05 \x01(\x05\x12\x13\n\x0b\x65xtra_state\x18\x06 \x01(\t\"_\n\tImageData\x12\x13\n\x0b\x63\x61mera_name\x18\x01 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\x12\r\n\x05width\x18\x03 \x01(\x05\x12\x0e\n\x06height\x18\x04 \x01(\x05\x12\x10\n\x08\x65ncoding\x18\x05 \x01(\t\"\x99\x01\n\x06\x41\x63tion\x12\x0e\n\x06values\x18\x01 \x03(\x02\x12\x13\n\x0bis_terminal\x18\x02 \x01(\x08\x12\x12\n\nconfidence\x18\x03 \x01(\x02\x12#\n\x06status\x18\x04 \x01(\x0e\x32\x13.lerobot.StatusCode\x12\x15\n\rerror_message\x18\x05 \x01(\t\x12\x1a\n\x12server_frame_index\x18\x06 \x01(\x05\"\x98\x01\n\x0e\x43ontrolCommand\x12\"\n\x04type\x18\x01 \x01(\x0e\x32\x14.lerobot.CommandType\x12\x33\n\x06params\x18\x02 \x03(\x0b\x32#.lerobot.ControlCommand.ParamsEntry\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"W\n\x12\x41\x63tionOutputConfig\x12\x16\n\x0e\x65nable_chassis\x18\x01 \x01(\x08\x12\x13\n\x0b\x65nable_head\x18\x02 \x01(\x08\x12\x14\n\x0c\x65nable_torso\x18\x03 \x01(\x08\"\x9f\x01\n\x0cPolicyConfig\x12\x0c\n\x04mode\x18\x01 \x01(\t\x12\x12\n\nmodel_path\x18\x02 \x01(\t\x12\x14\n\x0c\x64\x61taset_path\x18\x03 \x01(\t\x12\x0e\n\x06\x64\x65vice\x18\x04 \x01(\t\x12\x13\n\x0bpolicy_type\x18\x05 \x01(\t\x12\x32\n\raction_config\x18\x06 \x01(\x0b\x32\x1b.lerobot.ActionOutputConfig\"\xa7\x01\n\rServiceStatus\x12\x10\n\x08is_ready\x18\x01 \x01(\x08\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x17\n\x0f\x63urrent_episode\x18\x03 \x01(\x05\x12\x15\n\rcurrent_frame\x18\x04 \x01(\x05\x12\x14\n\x0ctotal_frames\x18\x05 \x01(\x05\x12\x0b\n\x03\x66ps\x18\x06 \x01(\x02\x12\x0f\n\x07message\x18\x07 \x01(\t\x12\x0c\n\x04mode\x18\x08 \x01(\t\"\x07\n\x05\x45mpty*h\n\nStatusCode\x12\x06\n\x02OK\x10\x00\x12\t\n\x05\x45RROR\x10\x01\x12\r\n\tNOT_READY\x10\x02\x12\x0f\n\x0b\x45PISODE_END\x10\x03\x12\x14\n\x10MODEL_NOT_LOADED\x10\x04\x12\x11\n\rINVALID_INPUT\x10\x05*1\n\x0b\x43ommandType\x12\r\n\tCMD_RESET\x10\x00\x12\x13\n\x0f\x43MD_SET_EPISODE\x10\x01\x32\xe5\x02\n\x17LeRobotInferenceService\x12:\n\tConfigure\x12\x15.lerobot.PolicyConfig\x1a\x16.lerobot.ServiceStatus\x12\x30\n\x07Predict\x12\x14.lerobot.Observation\x1a\x0f.lerobot.Action\x12:\n\rStreamPredict\x12\x14.lerobot.Observation\x1a\x0f.lerobot.Action(\x01\x30\x01\x12:\n\x07\x43ontrol\x12\x17.lerobot.ControlCommand\x1a\x16.lerobot.ServiceStatus\x12\x33\n\tGetStatus\x12\x0e.lerobot.Empty\x1a\x16.lerobot.ServiceStatus\x12/\n\x05Reset\x12\x0e.lerobot.Empty\x1a\x16.lerobot.ServiceStatusb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x17lerobot_inference.proto\x12\x07lerobot\"\x9b\x01\n\x0bObservation\x12\x17\n\x0fjoint_positions\x18\x01 \x03(\x02\x12\"\n\x06images\x18\x02 \x03(\x0b\x32\x12.lerobot.ImageData\x12\x11\n\ttimestamp\x18\x03 \x01(\x01\x12\x12\n\nepisode_id\x18\x04 \x01(\x05\x12\x13\n\x0b\x66rame_index\x18\x05 \x01(\x05\x12\x13\n\x0b\x65xtra_state\x18\x06 \x01(\t\"_\n\tImageData\x12\x13\n\x0b\x63\x61mera_name\x18\x01 \x01(\t\x12\x0c\n\x04\x64\x61ta\x18\x02 \x01(\x0c\x12\r\n\x05width\x18\x03 \x01(\x05\x12\x0e\n\x06height\x18\x04 \x01(\x05\x12\x10\n\x08\x65ncoding\x18\x05 \x01(\t\"\x99\x01\n\x06\x41\x63tion\x12\x0e\n\x06values\x18\x01 \x03(\x02\x12\x13\n\x0bis_terminal\x18\x02 \x01(\x08\x12\x12\n\nconfidence\x18\x03 \x01(\x02\x12#\n\x06status\x18\x04 \x01(\x0e\x32\x13.lerobot.StatusCode\x12\x15\n\rerror_message\x18\x05 \x01(\t\x12\x1a\n\x12server_frame_index\x18\x06 \x01(\x05\"\xc8\x01\n\x0b\x41\x63tionChunk\x12$\n\x07\x61\x63tions\x18\x01 \x03(\x0b\x32\x13.lerobot.ActionStep\x12\x12\n\nchunk_size\x18\x02 \x01(\x05\x12\x12\n\naction_dim\x18\x03 \x01(\x05\x12\x13\n\x0bis_terminal\x18\x04 \x01(\x08\x12#\n\x06status\x18\x05 \x01(\x0e\x32\x13.lerobot.StatusCode\x12\x15\n\rerror_message\x18\x06 \x01(\t\x12\x1a\n\x12server_frame_index\x18\x07 \x01(\x05\"\x1c\n\nActionStep\x12\x0e\n\x06values\x18\x01 \x03(\x02\"\x98\x01\n\x0e\x43ontrolCommand\x12\"\n\x04type\x18\x01 \x01(\x0e\x32\x14.lerobot.CommandType\x12\x33\n\x06params\x18\x02 \x03(\x0b\x32#.lerobot.ControlCommand.ParamsEntry\x1a-\n\x0bParamsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"W\n\x12\x41\x63tionOutputConfig\x12\x16\n\x0e\x65nable_chassis\x18\x01 \x01(\x08\x12\x13\n\x0b\x65nable_head\x18\x02 \x01(\x08\x12\x14\n\x0c\x65nable_torso\x18\x03 \x01(\x08\"\x9f\x01\n\x0cPolicyConfig\x12\x0c\n\x04mode\x18\x01 \x01(\t\x12\x12\n\nmodel_path\x18\x02 \x01(\t\x12\x14\n\x0c\x64\x61taset_path\x18\x03 \x01(\t\x12\x0e\n\x06\x64\x65vice\x18\x04 \x01(\t\x12\x13\n\x0bpolicy_type\x18\x05 \x01(\t\x12\x32\n\raction_config\x18\x06 \x01(\x0b\x32\x1b.lerobot.ActionOutputConfig\"\xa7\x01\n\rServiceStatus\x12\x10\n\x08is_ready\x18\x01 \x01(\x08\x12\x12\n\nmodel_name\x18\x02 \x01(\t\x12\x17\n\x0f\x63urrent_episode\x18\x03 \x01(\x05\x12\x15\n\rcurrent_frame\x18\x04 \x01(\x05\x12\x14\n\x0ctotal_frames\x18\x05 \x01(\x05\x12\x0b\n\x03\x66ps\x18\x06 \x01(\x02\x12\x0f\n\x07message\x18\x07 \x01(\t\x12\x0c\n\x04mode\x18\x08 \x01(\t\"\x07\n\x05\x45mpty*h\n\nStatusCode\x12\x06\n\x02OK\x10\x00\x12\t\n\x05\x45RROR\x10\x01\x12\r\n\tNOT_READY\x10\x02\x12\x0f\n\x0b\x45PISODE_END\x10\x03\x12\x14\n\x10MODEL_NOT_LOADED\x10\x04\x12\x11\n\rINVALID_INPUT\x10\x05*1\n\x0b\x43ommandType\x12\r\n\tCMD_RESET\x10\x00\x12\x13\n\x0f\x43MD_SET_EPISODE\x10\x01\x32\xa1\x03\n\x17LeRobotInferenceService\x12:\n\tConfigure\x12\x15.lerobot.PolicyConfig\x1a\x16.lerobot.ServiceStatus\x12\x30\n\x07Predict\x12\x14.lerobot.Observation\x1a\x0f.lerobot.Action\x12:\n\x0cPredictChunk\x12\x14.lerobot.Observation\x1a\x14.lerobot.ActionChunk\x12:\n\rStreamPredict\x12\x14.lerobot.Observation\x1a\x0f.lerobot.Action(\x01\x30\x01\x12:\n\x07\x43ontrol\x12\x17.lerobot.ControlCommand\x1a\x16.lerobot.ServiceStatus\x12\x33\n\tGetStatus\x12\x0e.lerobot.Empty\x1a\x16.lerobot.ServiceStatus\x12/\n\x05Reset\x12\x0e.lerobot.Empty\x1a\x16.lerobot.ServiceStatusb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,28 +33,32 @@ if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
   _globals['_CONTROLCOMMAND_PARAMSENTRY']._loaded_options = None
   _globals['_CONTROLCOMMAND_PARAMSENTRY']._serialized_options = b'8\001'
-  _globals['_STATUSCODE']._serialized_start=1032
-  _globals['_STATUSCODE']._serialized_end=1136
-  _globals['_COMMANDTYPE']._serialized_start=1138
-  _globals['_COMMANDTYPE']._serialized_end=1187
+  _globals['_STATUSCODE']._serialized_start=1265
+  _globals['_STATUSCODE']._serialized_end=1369
+  _globals['_COMMANDTYPE']._serialized_start=1371
+  _globals['_COMMANDTYPE']._serialized_end=1420
   _globals['_OBSERVATION']._serialized_start=37
   _globals['_OBSERVATION']._serialized_end=192
   _globals['_IMAGEDATA']._serialized_start=194
   _globals['_IMAGEDATA']._serialized_end=289
   _globals['_ACTION']._serialized_start=292
   _globals['_ACTION']._serialized_end=445
-  _globals['_CONTROLCOMMAND']._serialized_start=448
-  _globals['_CONTROLCOMMAND']._serialized_end=600
-  _globals['_CONTROLCOMMAND_PARAMSENTRY']._serialized_start=555
-  _globals['_CONTROLCOMMAND_PARAMSENTRY']._serialized_end=600
-  _globals['_ACTIONOUTPUTCONFIG']._serialized_start=602
-  _globals['_ACTIONOUTPUTCONFIG']._serialized_end=689
-  _globals['_POLICYCONFIG']._serialized_start=692
-  _globals['_POLICYCONFIG']._serialized_end=851
-  _globals['_SERVICESTATUS']._serialized_start=854
-  _globals['_SERVICESTATUS']._serialized_end=1021
-  _globals['_EMPTY']._serialized_start=1023
-  _globals['_EMPTY']._serialized_end=1030
-  _globals['_LEROBOTINFERENCESERVICE']._serialized_start=1190
-  _globals['_LEROBOTINFERENCESERVICE']._serialized_end=1547
+  _globals['_ACTIONCHUNK']._serialized_start=448
+  _globals['_ACTIONCHUNK']._serialized_end=648
+  _globals['_ACTIONSTEP']._serialized_start=650
+  _globals['_ACTIONSTEP']._serialized_end=678
+  _globals['_CONTROLCOMMAND']._serialized_start=681
+  _globals['_CONTROLCOMMAND']._serialized_end=833
+  _globals['_CONTROLCOMMAND_PARAMSENTRY']._serialized_start=788
+  _globals['_CONTROLCOMMAND_PARAMSENTRY']._serialized_end=833
+  _globals['_ACTIONOUTPUTCONFIG']._serialized_start=835
+  _globals['_ACTIONOUTPUTCONFIG']._serialized_end=922
+  _globals['_POLICYCONFIG']._serialized_start=925
+  _globals['_POLICYCONFIG']._serialized_end=1084
+  _globals['_SERVICESTATUS']._serialized_start=1087
+  _globals['_SERVICESTATUS']._serialized_end=1254
+  _globals['_EMPTY']._serialized_start=1256
+  _globals['_EMPTY']._serialized_end=1263
+  _globals['_LEROBOTINFERENCESERVICE']._serialized_start=1423
+  _globals['_LEROBOTINFERENCESERVICE']._serialized_end=1840
 # @@protoc_insertion_point(module_scope)

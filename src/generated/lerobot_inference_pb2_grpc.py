@@ -48,6 +48,11 @@ class LeRobotInferenceServiceStub(object):
                 request_serializer=lerobot__inference__pb2.Observation.SerializeToString,
                 response_deserializer=lerobot__inference__pb2.Action.FromString,
                 _registered_method=True)
+        self.PredictChunk = channel.unary_unary(
+                '/lerobot.LeRobotInferenceService/PredictChunk',
+                request_serializer=lerobot__inference__pb2.Observation.SerializeToString,
+                response_deserializer=lerobot__inference__pb2.ActionChunk.FromString,
+                _registered_method=True)
         self.StreamPredict = channel.stream_stream(
                 '/lerobot.LeRobotInferenceService/StreamPredict',
                 request_serializer=lerobot__inference__pb2.Observation.SerializeToString,
@@ -85,7 +90,16 @@ class LeRobotInferenceServiceServicer(object):
         raise NotImplementedError('Method not implemented!')
 
     def Predict(self, request, context):
-        """单次推理 (同步)
+        """单次推理 (同步) - 返回单个 action
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PredictChunk(self, request, context):
+        """Chunk 推理 (同步) - 一次性返回完整的 action chunk
+        适用于 action chunking 策略 (ACT, Diffusion 等)
+        Client 端在本地消费 chunk，用完后再请求新的
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -131,6 +145,11 @@ def add_LeRobotInferenceServiceServicer_to_server(servicer, server):
                     servicer.Predict,
                     request_deserializer=lerobot__inference__pb2.Observation.FromString,
                     response_serializer=lerobot__inference__pb2.Action.SerializeToString,
+            ),
+            'PredictChunk': grpc.unary_unary_rpc_method_handler(
+                    servicer.PredictChunk,
+                    request_deserializer=lerobot__inference__pb2.Observation.FromString,
+                    response_serializer=lerobot__inference__pb2.ActionChunk.SerializeToString,
             ),
             'StreamPredict': grpc.stream_stream_rpc_method_handler(
                     servicer.StreamPredict,
@@ -211,6 +230,33 @@ class LeRobotInferenceService(object):
             '/lerobot.LeRobotInferenceService/Predict',
             lerobot__inference__pb2.Observation.SerializeToString,
             lerobot__inference__pb2.Action.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PredictChunk(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lerobot.LeRobotInferenceService/PredictChunk',
+            lerobot__inference__pb2.Observation.SerializeToString,
+            lerobot__inference__pb2.ActionChunk.FromString,
             options,
             channel_credentials,
             insecure,

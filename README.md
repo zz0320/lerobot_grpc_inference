@@ -230,8 +230,12 @@ service LeRobotInferenceService {
     // Client 配置 Server 使用的模型/数据集
     rpc Configure(PolicyConfig) returns (ServiceStatus);
     
-    // 单次推理 (发送 state + images, 返回 action)
+    // 单次推理 (发送 state + images, 返回单个 action)
     rpc Predict(Observation) returns (Action);
+    
+    // Chunk 推理 (一次性返回完整的 action chunk)
+    // 适用于 action chunking 策略 (ACT, Diffusion 等)
+    rpc PredictChunk(Observation) returns (ActionChunk);
     
     // 流式推理 (双向流，高频控制)
     rpc StreamPredict(stream Observation) returns (stream Action);
@@ -245,6 +249,55 @@ service LeRobotInferenceService {
     // 重置
     rpc Reset(Empty) returns (ServiceStatus);
 }
+```
+
+## Action Chunking 模式
+
+对于使用 action chunking 的策略 (ACT, Diffusion 等)，支持两种推理模式：
+
+### 单步模式 (默认)
+每次调用 `Predict` 获取一个 action，Server 内部管理 action queue。
+
+### Chunk 模式 (推荐)
+使用 `PredictChunk` 一次性获取完整的 action chunk，Client 在本地消费。
+
+**优势：**
+- 减少网络调用频率 (从每帧调用变为每 chunk 调用一次)
+- 降低延迟
+- 更好的控制 action 消费逻辑
+
+```bash
+# 启用 chunk 模式
+python -m src.client.inference_client \
+    --server 192.168.1.100:50051 \
+    --model /path/to/act_model \
+    --use-chunk \
+    --n-action-steps 50  # 每个 chunk 使用前 50 个 action
+```
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                            Chunk 模式数据流                                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   Client                                                          Server            │
+│                                                                                     │
+│   ┌────────────────────────┐                                                        │
+│   │  ActionChunkManager    │                                                        │
+│   │  ┌──────────────────┐  │                                                        │
+│   │  │ action_queue     │  │ ◄──────────────────── PredictChunk()                   │
+│   │  │ [a0, a1, ..., aN]│  │        返回完整 chunk                                   │
+│   │  └──────────────────┘  │        (chunk_size, action_dim)                        │
+│   │         │              │                                                        │
+│   │    get_action()        │        仅当 queue 空时                                  │
+│   │         │              │ ────────────────────► 请求新 chunk                      │
+│   │         ▼              │                                                        │
+│   │  ┌──────────────────┐  │                                                        │
+│   │  │ 返回单个 action   │  │                                                        │
+│   │  └──────────────────┘  │                                                        │
+│   └────────────────────────┘                                                        │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Python API
@@ -360,6 +413,80 @@ while True:
     time.sleep(1.0 / 30)
 
 controller.close()
+```
+
+### Chunk 模式控制器 (推荐用于 ACT/Diffusion)
+
+```python
+from src.client.inference_client import AstribotController, ActionChunkManager
+from src.common.config import ClientConfig, ActionConfig
+
+# 配置
+config = ClientConfig(
+    server_host="192.168.1.100",
+    server_port=50051,
+    model_path="/path/to/act_model",
+    control_freq=30.0,
+    action_config=ActionConfig(state_includes_chassis=False)
+)
+
+# 创建控制器 (使用 chunk 模式)
+controller = AstribotController(
+    config,
+    use_chunk=True,           # 启用 chunk 模式
+    n_action_steps=50         # 每个 chunk 使用前 50 个 action
+)
+
+# 控制循环 (内部自动管理 chunk)
+controller.set_episode(0)
+controller.move_to_ready_position(duration=5.0)
+
+while True:
+    if not controller.step():  # 自动从本地 queue 获取 action，queue 空时请求新 chunk
+        break
+    time.sleep(1.0 / 30)
+
+controller.close()
+```
+
+### 直接使用 ActionChunkManager
+
+```python
+from src.client.inference_client import InferenceClient, ActionChunkManager
+
+# 创建客户端
+client = InferenceClient("192.168.1.100:50051")
+client.configure(mode="model", model_path="/path/to/act_model")
+
+# 创建 chunk 管理器
+chunk_manager = ActionChunkManager(
+    client=client,
+    n_action_steps=50,        # 每个 chunk 使用前 50 个 action
+    auto_refill_threshold=0.0 # 用完再请求新 chunk
+)
+
+# 控制循环
+for frame_idx in range(1000):
+    current_state = get_robot_state()
+    images = get_camera_images()
+    
+    # 获取 action (自动管理 chunk 请求)
+    action = chunk_manager.get_action(
+        joint_positions=current_state,
+        images=images,
+        episode_id=0,
+        frame_index=frame_idx
+    )
+    
+    if action is None:
+        print("Episode 结束")
+        break
+    
+    # 发送到机器人
+    send_to_robot(action)
+    time.sleep(1.0 / 30)
+
+client.close()
 ```
 
 ## ROS 相机话题

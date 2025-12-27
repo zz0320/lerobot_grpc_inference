@@ -69,6 +69,36 @@ message Action {
     int32 server_frame_index = 6;
 }
 
+// 动作块 - 一次性返回多个 action (用于 action chunking 策略)
+message ActionChunk {
+    // 多个 action，每个 action 是一个 float 数组
+    // actions[i] 对应第 i 步的 action
+    repeated ActionStep actions = 1;
+    
+    // chunk 大小 (action 数量)
+    int32 chunk_size = 2;
+    
+    // action 维度 (每个 action 的 float 数量)
+    int32 action_dim = 3;
+    
+    // 是否是最后一个 chunk (episode 结束)
+    bool is_terminal = 4;
+    
+    // 状态码
+    StatusCode status = 5;
+    
+    // 错误消息 (如果有)
+    string error_message = 6;
+    
+    // 服务端当前帧索引 (chunk 的起始帧)
+    int32 server_frame_index = 7;
+}
+
+// 单步 action (用于 ActionChunk)
+message ActionStep {
+    repeated float values = 1;
+}
+
 // 状态码
 enum StatusCode {
     OK = 0;
@@ -160,8 +190,13 @@ service LeRobotInferenceService {
     // 配置策略 - Client 连接时发送，指定模型/数据集路径
     rpc Configure(PolicyConfig) returns (ServiceStatus);
     
-    // 单次推理 (同步)
+    // 单次推理 (同步) - 返回单个 action
     rpc Predict(Observation) returns (Action);
+    
+    // Chunk 推理 (同步) - 一次性返回完整的 action chunk
+    // 适用于 action chunking 策略 (ACT, Diffusion 等)
+    // Client 端在本地消费 chunk，用完后再请求新的
+    rpc PredictChunk(Observation) returns (ActionChunk);
     
     // 流式推理 (双向流，用于高频控制)
     rpc StreamPredict(stream Observation) returns (stream Action);

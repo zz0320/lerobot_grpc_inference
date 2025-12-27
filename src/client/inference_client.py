@@ -12,6 +12,7 @@ import sys
 import time
 import signal
 import logging
+from collections import deque
 from typing import List, Optional, Iterator, Callable, Dict
 import numpy as np
 
@@ -240,6 +241,234 @@ def _signal_handler(signum, frame):
 signal.signal(signal.SIGINT, _signal_handler)
 
 
+class ActionChunkManager:
+    """
+    Action Chunk 管理器
+    
+    在 Client 端管理 action queue，实现：
+    1. 从 Server 获取完整的 action chunk
+    2. 在本地逐步消费 action
+    3. 当 queue 用完时，自动请求新的 chunk
+    
+    这种方式减少了网络调用频率，适用于 action chunking 策略 (ACT, Diffusion 等)
+    
+    Example:
+        >>> # 创建 chunk 管理器
+        >>> chunk_manager = ActionChunkManager(
+        ...     client=inference_client,
+        ...     n_action_steps=50  # 每个 chunk 使用的 action 数量
+        ... )
+        >>> 
+        >>> # 在控制循环中使用
+        >>> for frame_idx in range(1000):
+        ...     # 获取下一个 action (自动管理 chunk)
+        ...     action = chunk_manager.get_action(
+        ...         joint_positions=current_state,
+        ...         images=images,
+        ...         episode_id=0,
+        ...         frame_index=frame_idx
+        ...     )
+        ...     if action is None:
+        ...         break
+        ...     # 发送到机器人...
+    """
+    
+    def __init__(
+        self,
+        client: "InferenceClient",
+        n_action_steps: Optional[int] = None,
+        auto_refill_threshold: float = 0.0
+    ):
+        """
+        初始化 Action Chunk 管理器
+        
+        Args:
+            client: InferenceClient 实例
+            n_action_steps: 每个 chunk 实际使用的 action 数量
+                           如果为 None，使用 Server 返回的完整 chunk
+                           如果小于 chunk_size，只使用前 n_action_steps 个 action
+            auto_refill_threshold: 自动补充阈值 (0.0-1.0)
+                                   当 queue 剩余比例低于此值时提前获取新 chunk
+                                   0.0 表示用完才请求
+        """
+        self.client = client
+        self.n_action_steps = n_action_steps
+        self.auto_refill_threshold = auto_refill_threshold
+        
+        # Action queue
+        self._action_queue: deque = deque()
+        self._chunk_size = 0  # Server 返回的 chunk 大小
+        self._action_dim = 0
+        
+        # 状态
+        self._current_chunk_start_frame = 0
+        self._actions_consumed = 0  # 当前 chunk 已消费的 action 数
+        self._total_actions_consumed = 0  # 总共消费的 action 数
+        self._is_terminal = False
+        
+        logger.info(f"ActionChunkManager 初始化: n_action_steps={n_action_steps}, "
+                   f"auto_refill_threshold={auto_refill_threshold}")
+    
+    @property
+    def queue_size(self) -> int:
+        """当前 queue 中的 action 数量"""
+        return len(self._action_queue)
+    
+    @property
+    def chunk_size(self) -> int:
+        """Server 返回的 chunk 大小"""
+        return self._chunk_size
+    
+    @property
+    def action_dim(self) -> int:
+        """Action 维度"""
+        return self._action_dim
+    
+    @property
+    def is_empty(self) -> bool:
+        """Queue 是否为空"""
+        return len(self._action_queue) == 0
+    
+    @property
+    def is_terminal(self) -> bool:
+        """Episode 是否结束"""
+        return self._is_terminal and self.is_empty
+    
+    def reset(self):
+        """重置状态"""
+        self._action_queue.clear()
+        self._actions_consumed = 0
+        self._total_actions_consumed = 0
+        self._is_terminal = False
+        self._current_chunk_start_frame = 0
+        logger.debug("ActionChunkManager 已重置")
+    
+    def _should_refill(self) -> bool:
+        """检查是否需要补充 action"""
+        if self._is_terminal:
+            return False
+        if self._chunk_size == 0:
+            return True  # 首次请求
+        
+        effective_size = self.n_action_steps or self._chunk_size
+        remaining_ratio = len(self._action_queue) / effective_size
+        return remaining_ratio <= self.auto_refill_threshold
+    
+    def _fetch_chunk(
+        self,
+        joint_positions: List[float],
+        episode_id: int,
+        frame_index: int,
+        images: Optional[List[dict]] = None
+    ) -> bool:
+        """
+        从 Server 获取新的 action chunk
+        
+        Returns:
+            是否成功获取
+        """
+        logger.debug(f"请求新的 action chunk, frame_index={frame_index}")
+        
+        try:
+            chunk_response = self.client.predict_chunk(
+                joint_positions=joint_positions,
+                episode_id=episode_id,
+                frame_index=frame_index,
+                images=images
+            )
+            
+            if chunk_response.status == pb2.EPISODE_END:
+                logger.info("Episode 结束")
+                self._is_terminal = True
+                return False
+            
+            if chunk_response.status != pb2.OK:
+                logger.error(f"获取 chunk 失败: {chunk_response.error_message}")
+                return False
+            
+            # 更新 chunk 信息
+            self._chunk_size = chunk_response.chunk_size
+            self._action_dim = chunk_response.action_dim
+            self._current_chunk_start_frame = frame_index
+            
+            # 清空旧的 queue 并添加新的 actions
+            self._action_queue.clear()
+            self._actions_consumed = 0
+            
+            # 确定实际使用的 action 数量
+            n_to_use = self.n_action_steps if self.n_action_steps else self._chunk_size
+            n_to_use = min(n_to_use, len(chunk_response.actions))
+            
+            for i in range(n_to_use):
+                action = list(chunk_response.actions[i].values)
+                self._action_queue.append(action)
+            
+            logger.debug(f"获取到 chunk: size={self._chunk_size}, "
+                        f"使用={n_to_use}, dim={self._action_dim}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"获取 chunk 异常: {e}")
+            return False
+    
+    def get_action(
+        self,
+        joint_positions: List[float],
+        episode_id: int = 0,
+        frame_index: int = 0,
+        images: Optional[List[dict]] = None
+    ) -> Optional[List[float]]:
+        """
+        获取下一个 action
+        
+        自动管理 chunk 请求:
+        - 如果 queue 为空，请求新的 chunk
+        - 如果到达 auto_refill_threshold，提前请求
+        
+        Args:
+            joint_positions: 当前关节位置
+            episode_id: episode 索引
+            frame_index: 当前帧索引
+            images: 图像列表
+        
+        Returns:
+            action 列表，如果 episode 结束返回 None
+        """
+        # 检查是否需要获取新 chunk
+        if self.is_empty or self._should_refill():
+            # 计算请求 chunk 的起始帧
+            chunk_frame = self._current_chunk_start_frame + self._actions_consumed
+            if self.is_empty:
+                chunk_frame = frame_index
+            
+            if not self._fetch_chunk(joint_positions, episode_id, chunk_frame, images):
+                if self._is_terminal and not self.is_empty:
+                    pass  # 还有剩余 action，继续消费
+                elif self.is_empty:
+                    return None
+        
+        # 从 queue 中取出 action
+        if self.is_empty:
+            return None
+        
+        action = self._action_queue.popleft()
+        self._actions_consumed += 1
+        self._total_actions_consumed += 1
+        
+        return action
+    
+    def peek_action(self) -> Optional[List[float]]:
+        """查看下一个 action (不移除)"""
+        if self.is_empty:
+            return None
+        return list(self._action_queue[0])
+    
+    def get_remaining_actions(self) -> List[List[float]]:
+        """获取所有剩余的 actions"""
+        return [list(a) for a in self._action_queue]
+
+
 class InferenceClient:
     """
     gRPC 推理客户端
@@ -447,6 +676,60 @@ class InferenceClient:
         
         return self.stub.Predict(obs)
     
+    def predict_chunk(
+        self,
+        joint_positions: List[float],
+        episode_id: int = 0,
+        frame_index: int = 0,
+        images: Optional[List[dict]] = None,
+        extra_state: str = ""
+    ) -> "pb2.ActionChunk":
+        """
+        Chunk 推理 - 一次性获取完整的 action chunk
+        
+        适用于 action chunking 策略 (ACT, Diffusion 等)
+        Server 返回完整的 action chunk，Client 在本地消费
+        
+        Args:
+            joint_positions: 当前关节位置
+            episode_id: episode 索引
+            frame_index: 帧索引 (chunk 的起始帧)
+            images: 图像列表，使用 encode_image() 编码
+            extra_state: 额外状态信息 (JSON)
+        
+        Returns:
+            ActionChunk 响应，包含多个 action
+            
+        Example:
+            >>> # 获取 action chunk
+            >>> chunk = client.predict_chunk(joint_positions=[0.0] * 22, frame_index=0)
+            >>> print(f"Chunk size: {chunk.chunk_size}, Action dim: {chunk.action_dim}")
+            >>> 
+            >>> # 逐步消费 chunk 中的 action
+            >>> for action_step in chunk.actions:
+            ...     action = list(action_step.values)
+            ...     # 发送到机器人...
+        """
+        obs = pb2.Observation(
+            joint_positions=joint_positions,
+            timestamp=time.time(),
+            episode_id=episode_id,
+            frame_index=frame_index,
+            extra_state=extra_state
+        )
+        
+        if images:
+            for img in images:
+                obs.images.append(pb2.ImageData(
+                    camera_name=img.get('name', 'cam'),
+                    data=img.get('data', b''),
+                    width=img.get('width', 0),
+                    height=img.get('height', 0),
+                    encoding=img.get('encoding', 'jpeg')
+                ))
+        
+        return self.stub.PredictChunk(obs)
+    
     def stream_predict(
         self,
         observation_generator: Callable[[], Optional["pb2.Observation"]]
@@ -494,9 +777,20 @@ class AstribotController:
     Astribot 机器人控制器
     
     整合 gRPC 客户端、机器人 SDK 和相机订阅
+    
+    支持两种推理模式:
+    1. 单步模式 (use_chunk=False): 每次请求获取一个 action
+    2. Chunk 模式 (use_chunk=True): 一次获取完整 action chunk，本地消费
     """
     
-    def __init__(self, config: ClientConfig, enable_camera: bool = False, camera_names: List[str] = None):
+    def __init__(
+        self, 
+        config: ClientConfig, 
+        enable_camera: bool = False, 
+        camera_names: List[str] = None,
+        use_chunk: bool = False,
+        n_action_steps: Optional[int] = None
+    ):
         """
         初始化控制器
         
@@ -504,12 +798,17 @@ class AstribotController:
             config: 客户端配置
             enable_camera: 是否启用相机订阅 (用于视觉策略)
             camera_names: 要订阅的相机名称列表，默认 ['head', 'wrist_left', 'wrist_right']
+            use_chunk: 是否使用 chunk 模式
+            n_action_steps: chunk 模式下每个 chunk 使用的 action 数量
         """
         self.config = config
+        self._use_chunk = use_chunk
+        self._n_action_steps = n_action_steps
         
         logger.info(f"初始化 AstribotController")
         logger.info(f"  - 服务器: {config.server_address}")
         logger.info(f"  - 控制频率: {config.control_freq} Hz")
+        logger.info(f"  - 推理模式: {'Chunk' if use_chunk else '单步'}")
         
         # 初始化推理客户端
         self.inference_client = InferenceClient(
@@ -567,6 +866,16 @@ class AstribotController:
         # 维度配置 (分离输入和执行)
         self._state_includes_chassis = self.config.action_config.state_includes_chassis  # 输入 state 是否含底盘
         self._execute_chassis = self.config.action_config.execute_chassis  # 执行时是否控制底盘
+        
+        # Chunk 模式管理器
+        self._chunk_manager: Optional[ActionChunkManager] = None
+        if self._use_chunk:
+            self._chunk_manager = ActionChunkManager(
+                client=self.inference_client,
+                n_action_steps=self._n_action_steps,
+                auto_refill_threshold=0.0  # 用完再请求
+            )
+            logger.info(f"  - Chunk 模式: n_action_steps={self._n_action_steps}")
         
         logger.info(f"  - 输入 state 维度: {22 if not self._state_includes_chassis else 25}")
         logger.info(f"  - 执行底盘控制: {self._execute_chassis}")
@@ -754,6 +1063,10 @@ class AstribotController:
         """
         执行一步推理和控制
         
+        支持两种模式:
+        1. 单步模式: 每次请求获取一个 action
+        2. Chunk 模式: 从本地 action queue 获取，queue 空时请求新 chunk
+        
         Args:
             with_images: 是否发送图像，None 表示根据 enable_camera 自动决定
         
@@ -769,22 +1082,35 @@ class AstribotController:
         if send_images:
             images = self.get_current_images()
         
-        # 发送观测数据 (本体状态 + 图像) 到 Server
-        response = self.inference_client.predict(
-            joint_positions=joint_positions,
-            images=images,
-            episode_id=self._episode_id,
-            frame_index=self._frame_index
-        )
-        
-        if response.status == pb2.EPISODE_END or response.is_terminal:
-            return False
-        
-        if response.status != pb2.OK:
-            logger.error(f"推理错误: {response.error_message}")
-            return False
-        
-        action = list(response.values)
+        # 根据模式获取 action
+        if self._use_chunk and self._chunk_manager is not None:
+            # Chunk 模式: 从本地 queue 获取 action
+            action = self._chunk_manager.get_action(
+                joint_positions=joint_positions,
+                images=images,
+                episode_id=self._episode_id,
+                frame_index=self._frame_index
+            )
+            
+            if action is None:
+                return False
+        else:
+            # 单步模式: 每次请求一个 action
+            response = self.inference_client.predict(
+                joint_positions=joint_positions,
+                images=images,
+                episode_id=self._episode_id,
+                frame_index=self._frame_index
+            )
+            
+            if response.status == pb2.EPISODE_END or response.is_terminal:
+                return False
+            
+            if response.status != pb2.OK:
+                logger.error(f"推理错误: {response.error_message}")
+                return False
+            
+            action = list(response.values)
         
         # 应用速度限制
         if self.velocity_limiter:
@@ -820,6 +1146,8 @@ class AstribotController:
             self.smoother.reset()
         if self.velocity_limiter:
             self.velocity_limiter.reset()
+        if self._chunk_manager:
+            self._chunk_manager.reset()
     
     def close(self):
         """关闭控制器"""
@@ -1010,6 +1338,12 @@ def main():
     parser.add_argument('--max-velocity', type=float, default=0.0,
                         help='最大速度 rad/frame (0=不限制)')
     
+    # Chunk 模式配置
+    parser.add_argument('--use-chunk', action='store_true',
+                        help='使用 chunk 模式: 一次获取完整 action chunk，本地消费')
+    parser.add_argument('--n-action-steps', type=int, default=None,
+                        help='Chunk 模式下每个 chunk 使用的 action 数量 (默认: 使用完整 chunk)')
+    
     # 准备位置配置
     parser.add_argument('--move-to-ready', action='store_true', default=True,
                         help='启动时先移动到准备位置 (默认: 开启)')
@@ -1066,7 +1400,9 @@ def main():
         controller = AstribotController(
             config,
             enable_camera=args.enable_camera,
-            camera_names=camera_names
+            camera_names=camera_names,
+            use_chunk=args.use_chunk,
+            n_action_steps=args.n_action_steps
         )
         
         run_inference_loop(

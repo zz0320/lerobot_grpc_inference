@@ -830,7 +830,14 @@ class LeRobotInferenceServicer(pb2_grpc.LeRobotInferenceServiceServicer):
         - n_action_steps: "10" (每隔多少步推理)
         - temporal_ensemble_coeff: "0.01" (指数衰减系数)
         """
-        params = dict(request.params) if request.params else {}
+        # 检查是否有 params 字段
+        if not hasattr(request, 'params'):
+            return None
+        
+        try:
+            params = dict(request.params) if request.params else {}
+        except Exception:
+            return None
         
         # 检查是否有 temporal ensemble 相关参数
         if not any(k.startswith('temporal') or k == 'n_action_steps' for k in params):

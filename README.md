@@ -253,6 +253,16 @@ python -m src.client.inference_client \
     --dataset /path/to/dataset \
     --smooth 5 \
     --max-velocity 0.05
+
+# ⭐ 推荐: 视觉策略 + Chunk模式 + 平滑 (猫砂任务)
+python -m src.client.inference_client \
+    --server 0.0.0.0:50053 \
+    --model /root/astribot_raw_datasets/astribot_catlitter/0260000_0110/pretrained_model \
+    --enable-camera \
+    --state-with-chassis \
+    --smooth 5 \
+    --use-chunk \
+    --n-action-steps 30
 ```
 
 ## 配置参数

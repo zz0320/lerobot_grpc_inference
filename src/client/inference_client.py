@@ -5,6 +5,10 @@ LeRobot 推理客户端 (精简版)
 
 通过 gRPC 连接远程推理服务器获取 action
 配置方式: Client 连接时通过 Configure() 指定模型/数据集
+
+支持推理日志记录:
+    启用 --enable-logging 参数可记录全部推理信息 (state, action, image)
+    日志保存在 --log-dir 指定的目录下
 """
 
 import os
@@ -41,7 +45,8 @@ from src.common.utils import (
     setup_logging, 
     ActionSmoother, 
     VelocityLimiter,
-    lerobot_action_to_waypoint
+    lerobot_action_to_waypoint,
+    binarize_gripper_action
 )
 from src.common.constants import (
     ASTRIBOT_NAMES_LIST,
@@ -53,6 +58,9 @@ from src.common.constants import (
     READY_POSITION_22,
     READY_POSITION_25,
 )
+
+# 导入日志记录器
+from src.client.inference_logger import InferenceLogger
 
 # Astribot SDK
 HAS_ASTRIBOT = False
@@ -341,6 +349,7 @@ class ActionChunkManager:
         self._total_actions_consumed = 0
         self._is_terminal = False
         self._current_chunk_start_frame = 0
+        self._last_action_triggered_inference = False  # 上次 get_action 是否触发了新的推理
         logger.debug("ActionChunkManager 已重置")
     
     def _should_refill(self) -> bool:
@@ -435,6 +444,9 @@ class ActionChunkManager:
         Returns:
             action 列表，如果 episode 结束返回 None
         """
+        # 重置推理标志
+        self._last_action_triggered_inference = False
+        
         # 检查是否需要获取新 chunk
         if self.is_empty or self._should_refill():
             # 计算请求 chunk 的起始帧
@@ -442,7 +454,10 @@ class ActionChunkManager:
             if self.is_empty:
                 chunk_frame = frame_index
             
-            if not self._fetch_chunk(joint_positions, episode_id, chunk_frame, images):
+            if self._fetch_chunk(joint_positions, episode_id, chunk_frame, images):
+                # 成功获取新 chunk，标记为推理帧
+                self._last_action_triggered_inference = True
+            else:
                 if self._is_terminal and not self.is_empty:
                     pass  # 还有剩余 action，继续消费
                 elif self.is_empty:
@@ -467,6 +482,11 @@ class ActionChunkManager:
     def get_remaining_actions(self) -> List[List[float]]:
         """获取所有剩余的 actions"""
         return [list(a) for a in self._action_queue]
+    
+    @property
+    def last_action_triggered_inference(self) -> bool:
+        """上次 get_action() 是否触发了新的模型推理"""
+        return self._last_action_triggered_inference
 
 
 class InferenceClient:
@@ -781,6 +801,9 @@ class AstribotController:
     支持两种推理模式:
     1. 单步模式 (use_chunk=False): 每次请求获取一个 action
     2. Chunk 模式 (use_chunk=True): 一次获取完整 action chunk，本地消费
+    
+    支持推理日志记录:
+    传入 inference_logger 参数可记录全部推理信息 (state, action, image)
     """
     
     def __init__(
@@ -789,7 +812,10 @@ class AstribotController:
         enable_camera: bool = False, 
         camera_names: List[str] = None,
         use_chunk: bool = False,
-        n_action_steps: Optional[int] = None
+        n_action_steps: Optional[int] = None,
+        inference_logger: Optional[InferenceLogger] = None,
+        binarize_gripper: bool = False,
+        gripper_threshold: float = 80.0
     ):
         """
         初始化控制器
@@ -800,15 +826,28 @@ class AstribotController:
             camera_names: 要订阅的相机名称列表，默认 ['head', 'wrist_left', 'wrist_right']
             use_chunk: 是否使用 chunk 模式
             n_action_steps: chunk 模式下每个 chunk 使用的 action 数量
+            inference_logger: 推理日志记录器
+            binarize_gripper: 是否启用夹爪二值化控制 (0/100)
+            gripper_threshold: 夹爪二值化阈值 (默认 80.0)
         """
         self.config = config
         self._use_chunk = use_chunk
         self._n_action_steps = n_action_steps
         
+        # 推理日志记录器
+        self.inference_logger = inference_logger
+        
+        # 夹爪二值化配置
+        self._binarize_gripper = binarize_gripper
+        self._gripper_threshold = gripper_threshold
+        
         logger.info(f"初始化 AstribotController")
         logger.info(f"  - 服务器: {config.server_address}")
         logger.info(f"  - 控制频率: {config.control_freq} Hz")
         logger.info(f"  - 推理模式: {'Chunk' if use_chunk else '单步'}")
+        logger.info(f"  - 推理日志: {'启用' if inference_logger else '禁用'}")
+        if binarize_gripper:
+            logger.info(f"  - 夹爪二值化: 启用 (阈值={gripper_threshold})")
         
         # 初始化推理客户端
         self.inference_client = InferenceClient(
@@ -879,6 +918,9 @@ class AstribotController:
         
         logger.info(f"  - 输入 state 维度: {22 if not self._state_includes_chassis else 25}")
         logger.info(f"  - 执行底盘控制: {self._execute_chassis}")
+        
+        # 初始过渡配置 (用于平滑过渡到第一帧 action，避免初始跳变)
+        self._initial_transition_duration = 0.0  # 默认不执行过渡
     
     def _get_names_list(self, include_chassis: bool = None) -> List[str]:
         """
@@ -923,22 +965,67 @@ class AstribotController:
     
     def get_current_joint_positions(self) -> List[float]:
         """
-        获取当前关节位置 (state)
+        获取当前关节位置 (state) - 从机器人本体实时读取
         
         Returns:
             关节位置列表，维度由 state_includes_chassis 决定:
             - state_includes_chassis=False: 22维
             - state_includes_chassis=True: 25维
+            
+        数据来源:
+            - 如果 Astribot SDK 可用: 从机器人本体读取真实关节反馈
+            - 否则: 返回上次发送的命令位置 (追踪模式)
         """
+        from src.common.utils import waypoint_to_lerobot_action
+        
+        # 优先从机器人本体读取真实状态
+        if self.astribot is not None:
+            try:
+                # 获取真实关节位置
+                # 返回格式: [[torso(4)], [arm_left(7)], [gripper_left(1)], [arm_right(7)], [gripper_right(1)], [head(2)]]
+                # 注意: 默认不含底盘，需要单独获取
+                names_list = [
+                    'astribot_torso',
+                    'astribot_arm_left', 
+                    'astribot_gripper_left',
+                    'astribot_arm_right', 
+                    'astribot_gripper_right',
+                    'astribot_head',
+                ]
+                
+                current_positions = self.astribot.get_current_joints_position(names_list)
+                
+                # current_positions 格式已经是 waypoint 格式
+                # [torso(4), arm_left(7), gripper_left(1), arm_right(7), gripper_right(1), head(2)]
+                waypoint = current_positions
+                
+                # 如果需要底盘数据
+                if self._state_includes_chassis:
+                    try:
+                        chassis_pos = self.astribot.get_current_joints_position(['astribot_chassis'])
+                        if chassis_pos and len(chassis_pos) > 0:
+                            waypoint = list(waypoint) + [chassis_pos[0]]
+                    except Exception as e:
+                        logger.debug(f"获取底盘位置失败: {e}, 使用零值")
+                        waypoint = list(waypoint) + [[0.0, 0.0, 0.0]]
+                
+                # 转换为 lerobot action 格式
+                return waypoint_to_lerobot_action(
+                    waypoint, 
+                    include_chassis=self._state_includes_chassis
+                )
+                
+            except Exception as e:
+                logger.warning(f"从机器人读取关节位置失败: {e}, 回退到追踪模式")
+        
+        # 回退: 使用追踪的命令位置
         if self._current_waypoint:
-            # 从 waypoint 转换回 lerobot action 格式
-            from src.common.utils import waypoint_to_lerobot_action
             return waypoint_to_lerobot_action(
                 self._current_waypoint, 
-                include_chassis=self._state_includes_chassis  # 输入维度由此控制
+                include_chassis=self._state_includes_chassis
             )
         
-        # 返回零向量，维度由 state_includes_chassis 决定
+        # 最后回退: 返回零向量
         dim = LEROBOT_ACTION_DIM_WITH_CHASSIS if self._state_includes_chassis else LEROBOT_ACTION_DIM_NO_CHASSIS
         return [0.0] * dim
     
@@ -1082,6 +1169,12 @@ class AstribotController:
         if send_images:
             images = self.get_current_images()
         
+        # 记录推理开始时间 (用于计算延迟)
+        inference_start_time = time.time()
+        
+        # 标记是否是真正的推理帧 (用于决定是否保存图像)
+        is_inference_frame = True
+        
         # 根据模式获取 action
         if self._use_chunk and self._chunk_manager is not None:
             # Chunk 模式: 从本地 queue 获取 action
@@ -1094,8 +1187,11 @@ class AstribotController:
             
             if action is None:
                 return False
+            
+            # 检查是否触发了新的推理
+            is_inference_frame = self._chunk_manager.last_action_triggered_inference
         else:
-            # 单步模式: 每次请求一个 action
+            # 单步模式: 每次请求一个 action，每帧都是推理帧
             response = self.inference_client.predict(
                 joint_positions=joint_positions,
                 images=images,
@@ -1111,6 +1207,28 @@ class AstribotController:
                 return False
             
             action = list(response.values)
+            is_inference_frame = True  # 单步模式每帧都是推理帧
+        
+        # 计算推理延迟
+        inference_latency_ms = (time.time() - inference_start_time) * 1000
+        
+        # 记录推理日志 (在应用后处理之前记录原始 action)
+        # 只有推理帧才保存图像，但所有帧都记录数据
+        if self.inference_logger:
+            self.inference_logger.log_step(
+                frame_index=self._frame_index,
+                state=joint_positions,
+                action=action,
+                images=images,
+                episode_id=self._episode_id,
+                latency_ms=inference_latency_ms,
+                extra_info={
+                    "use_chunk": self._use_chunk,
+                    "control_freq": self.control_freq,
+                    "is_inference_frame": is_inference_frame
+                },
+                save_images_this_step=is_inference_frame
+            )
         
         # 应用速度限制
         if self.velocity_limiter:
@@ -1119,6 +1237,10 @@ class AstribotController:
         # 应用平滑
         if self.smoother:
             action = self.smoother.smooth(action)
+        
+        # 应用夹爪二值化 (0/100 控制)
+        if self._binarize_gripper:
+            action = binarize_gripper_action(action, threshold=self._gripper_threshold)
         
         # 发送到机器人 (根据 execute_chassis 决定是否控制底盘)
         waypoint = lerobot_action_to_waypoint(action, include_chassis=self._execute_chassis)
@@ -1148,6 +1270,99 @@ class AstribotController:
             self.velocity_limiter.reset()
         if self._chunk_manager:
             self._chunk_manager.reset()
+    
+    def set_initial_transition(self, duration: float):
+        """
+        设置初始过渡时间
+        
+        在开始推理前，先获取第一帧 action，然后平滑过渡到该位置，
+        避免从当前位置直接跳变到第一帧 action。
+        
+        Args:
+            duration: 过渡时间 (秒)，0 表示不执行过渡
+        """
+        self._initial_transition_duration = duration
+        if duration > 0:
+            logger.info(f"已启用初始过渡: {duration}s")
+    
+    def _perform_initial_transition(self):
+        """
+        执行初始过渡
+        
+        获取第一帧 action，然后用路径规划平滑过渡到该位置
+        """
+        if self._initial_transition_duration <= 0:
+            return
+        
+        logger.info("=" * 60)
+        logger.info("初始过渡: 平滑移动到第一帧 Action")
+        logger.info("=" * 60)
+        
+        # 获取当前状态
+        joint_positions = self.get_current_joint_positions()
+        
+        # 获取图像
+        images = None
+        if self._enable_camera:
+            images = self.get_current_images()
+        
+        # 获取第一帧 action (不消费，只是预览)
+        if self._use_chunk and self._chunk_manager is not None:
+            # Chunk 模式: 获取 chunk 并预览第一个 action
+            chunk_response = self.inference_client.predict_chunk(
+                joint_positions=joint_positions,
+                episode_id=self._episode_id,
+                frame_index=0,
+                images=images
+            )
+            if chunk_response.status == pb2.OK and len(chunk_response.actions) > 0:
+                first_action = list(chunk_response.actions[0].values)
+            else:
+                logger.warning("无法获取第一帧 action，跳过初始过渡")
+                return
+            
+            # 重置 chunk manager（因为我们只是预览，不消费）
+            self._chunk_manager.reset()
+        else:
+            # 单步模式: 预测第一帧 action
+            response = self.inference_client.predict(
+                joint_positions=joint_positions,
+                episode_id=self._episode_id,
+                frame_index=0,
+                images=images
+            )
+            if response.status == pb2.OK:
+                first_action = list(response.values)
+            else:
+                logger.warning("无法获取第一帧 action，跳过初始过渡")
+                return
+            
+            # 重置服务端状态
+            self.inference_client.reset()
+        
+        # 计算跳变
+        current_state = joint_positions[:len(first_action)]  # 截取相同维度
+        max_diff = max(abs(a - s) for a, s in zip(first_action, current_state))
+        logger.info(f"当前状态到第一帧 Action 的最大跳变: {max_diff:.4f} rad ({np.degrees(max_diff):.2f}°)")
+        
+        # 使用路径规划平滑过渡
+        logger.info(f"执行平滑过渡 ({self._initial_transition_duration}s)...")
+        
+        waypoint = lerobot_action_to_waypoint(first_action, include_chassis=self._execute_chassis)
+        
+        if self.astribot:
+            self.astribot.move_joints_waypoints(
+                self._get_names_list(),
+                [waypoint],
+                [self._initial_transition_duration],
+                use_wbc=self._use_wbc
+            )
+        else:
+            time.sleep(self._initial_transition_duration)
+        
+        self._current_waypoint = waypoint
+        logger.info("✓ 初始过渡完成")
+        logger.info("=" * 60)
     
     def close(self):
         """关闭控制器"""
@@ -1191,6 +1406,22 @@ def run_inference_loop(
     logger.info(f"  - 控制频率: {controller.control_freq} Hz")
     logger.info("=" * 60)
     
+    # 启动推理日志会话
+    if controller.inference_logger:
+        controller.inference_logger.start_session(
+            episode_id=episode,
+            model_path=controller.config.model_path,
+            dataset_path=controller.config.dataset_path,
+            config={
+                "control_freq": controller.config.control_freq,
+                "control_way": controller.config.control_way,
+                "smooth_window": controller.config.smooth_window,
+                "max_velocity": controller.config.max_velocity,
+                "use_chunk": controller._use_chunk,
+                "n_action_steps": controller._n_action_steps,
+            }
+        )
+    
     # 设置 episode
     controller.set_episode(episode)
     
@@ -1226,6 +1457,11 @@ def run_inference_loop(
     # 从 frame_index=0 开始
     controller._frame_index = 0
     
+    # 可选：平滑过渡到第一帧 action（避免初始跳变）
+    if hasattr(controller, '_initial_transition_duration') and controller._initial_transition_duration > 0:
+        logger.info(f"执行初始过渡 ({controller._initial_transition_duration}s)...")
+        controller._perform_initial_transition()
+    
     control_period = controller.control_period
     
     start_time = time.time()
@@ -1257,6 +1493,10 @@ def run_inference_loop(
     if frame_count > 0:
         logger.info(f"推理完成! 帧数: {frame_count}, 耗时: {total_time:.2f}s, "
                    f"平均频率: {frame_count/total_time:.1f}Hz")
+    
+    # 结束推理日志会话
+    if controller.inference_logger:
+        controller.inference_logger.end_session()
 
 
 def main():
@@ -1318,8 +1558,8 @@ def main():
     # 相机配置
     parser.add_argument('--enable-camera', action='store_true',
                         help='启用相机订阅，发送图像到 Server (视觉策略需要)')
-    parser.add_argument('--cameras', type=str, default='head,wrist_left,wrist_right',
-                        help='要订阅的相机列表 (逗号分隔，默认: head,wrist_left,wrist_right)')
+    parser.add_argument('--cameras', type=str, default='head,wrist_left,wrist_right,torso',
+                        help='要订阅的相机列表 (逗号分隔，默认: head,wrist_left,wrist_right,torso)')
     
     # 回放配置
     parser.add_argument('--episode', type=int, default=0,
@@ -1344,6 +1584,12 @@ def main():
     parser.add_argument('--n-action-steps', type=int, default=None,
                         help='Chunk 模式下每个 chunk 使用的 action 数量 (默认: 使用完整 chunk)')
     
+    # 夹爪二值化配置
+    parser.add_argument('--binarize-gripper', action='store_true',
+                        help='启用夹爪二值化控制: 超过阈值输出100，否则输出0')
+    parser.add_argument('--gripper-threshold', type=float, default=80.0,
+                        help='夹爪二值化阈值 (默认: 80.0)')
+    
     # 准备位置配置
     parser.add_argument('--move-to-ready', action='store_true', default=True,
                         help='启动时先移动到准备位置 (默认: 开启)')
@@ -1351,6 +1597,28 @@ def main():
                         help='禁用移动到准备位置，直接开始推理')
     parser.add_argument('--ready-duration', type=float, default=5.0,
                         help='移动到准备位置的时间 (默认: 5.0s)')
+    
+    # 初始过渡配置 (解决初始跳变问题)
+    parser.add_argument('--initial-transition', type=float, default=0.0,
+                        help='初始过渡时间 (秒): 在推理开始前，先平滑过渡到第一帧 action，'
+                             '避免初始跳变。建议设置 2.0-5.0s (默认: 0 不启用)')
+    
+    # 日志配置 (默认启用)
+    parser.add_argument('--enable-logging', action='store_true', default=True,
+                        help='启用推理日志记录 (记录 state, action, image) [默认: 开启]')
+    parser.add_argument('--no-logging', action='store_true',
+                        help='禁用推理日志记录')
+    parser.add_argument('--log-dir', type=str, default='./inference_logs',
+                        help='日志保存目录 (默认: ./inference_logs)')
+    parser.add_argument('--log-session-name', type=str, default=None,
+                        help='日志会话名称 (默认: 自动生成时间戳)')
+    parser.add_argument('--log-save-images', action='store_true', default=True,
+                        help='日志是否保存图像 (默认: 是)')
+    parser.add_argument('--no-log-save-images', action='store_true',
+                        help='日志不保存图像')
+    parser.add_argument('--log-image-format', type=str, default='jpg',
+                        choices=['jpg', 'png'],
+                        help='日志图像格式 (默认: jpg)')
     
     args = parser.parse_args()
     
@@ -1389,6 +1657,7 @@ def main():
     )
     
     controller = None
+    inference_logger = None
     
     # 解析相机列表
     camera_names = [c.strip() for c in args.cameras.split(',') if c.strip()]
@@ -1396,14 +1665,38 @@ def main():
     # 是否移动到准备位置
     move_to_ready = args.move_to_ready and not args.no_move_to_ready
     
+    # 创建推理日志记录器 (默认启用，除非指定 --no-logging)
+    enable_logging = args.enable_logging and not args.no_logging
+    if enable_logging:
+        log_save_images = args.log_save_images and not args.no_log_save_images
+        inference_logger = InferenceLogger(
+            log_dir=args.log_dir,
+            session_name=args.log_session_name,
+            save_images=log_save_images,
+            image_format=args.log_image_format,
+            enabled=True
+        )
+        logger.info(f"推理日志已启用: {args.log_dir}")
+        logger.info(f"  - 保存图像: {log_save_images}")
+        logger.info(f"  - 图像格式: {args.log_image_format}")
+    else:
+        logger.info("推理日志已禁用")
+    
     try:
         controller = AstribotController(
             config,
             enable_camera=args.enable_camera,
             camera_names=camera_names,
             use_chunk=args.use_chunk,
-            n_action_steps=args.n_action_steps
+            n_action_steps=args.n_action_steps,
+            inference_logger=inference_logger,
+            binarize_gripper=args.binarize_gripper,
+            gripper_threshold=args.gripper_threshold
         )
+        
+        # 设置初始过渡 (解决初始跳变问题)
+        if args.initial_transition > 0:
+            controller.set_initial_transition(args.initial_transition)
         
         run_inference_loop(
             controller,
@@ -1424,6 +1717,9 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
+        # 确保日志会话被正确关闭
+        if inference_logger:
+            inference_logger.end_session()
         if controller:
             controller.close()
         logger.info("程序退出")

@@ -10,6 +10,8 @@ import numpy as np
 
 from .constants import (
     ARM_INDICES,
+    GRIPPER_LEFT_INDEX,
+    GRIPPER_RIGHT_INDEX,
     LEROBOT_ACTION_DIM_NO_CHASSIS,
     LEROBOT_ACTION_DIM_WITH_CHASSIS,
 )
@@ -120,6 +122,43 @@ class VelocityLimiter:
     def reset(self):
         """重置状态"""
         self._last_action = None
+
+
+def binarize_gripper_action(
+    action: List[float],
+    threshold: float = 80.0,
+    high_value: float = 100.0,
+    low_value: float = 0.0
+) -> List[float]:
+    """
+    将夹爪控制二值化 (0/1 控制)
+    
+    当夹爪值超过阈值时设为 high_value，否则设为 low_value
+    
+    Args:
+        action: LeRobot action 数组 (22或25维)
+        threshold: 阈值 (默认 80.0)
+        high_value: 超过阈值时的值 (默认 100.0 = 完全闭合)
+        low_value: 低于阈值时的值 (默认 0.0 = 完全张开)
+        
+    Returns:
+        处理后的 action 数组
+        
+    Note:
+        - gripper_left 在索引 14
+        - gripper_right 在索引 15
+    """
+    action = list(action)  # 复制一份，避免修改原数组
+    
+    # 处理 gripper_left (索引 14)
+    if len(action) > GRIPPER_LEFT_INDEX:
+        action[GRIPPER_LEFT_INDEX] = high_value if action[GRIPPER_LEFT_INDEX] > threshold else low_value
+    
+    # 处理 gripper_right (索引 15)
+    if len(action) > GRIPPER_RIGHT_INDEX:
+        action[GRIPPER_RIGHT_INDEX] = high_value if action[GRIPPER_RIGHT_INDEX] > threshold else low_value
+    
+    return action
 
 
 def lerobot_action_to_waypoint(action: List[float], include_chassis: bool = False) -> List[List[float]]:

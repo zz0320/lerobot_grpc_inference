@@ -27,6 +27,7 @@
 │  │ • AstribotController          │         │ • LeRobotInferenceServicer        │   │
 │  │   - 两阶段控制                 │         │   - Configure/Predict/Reset       │   │
 │  │   - 动作平滑/速度限制          │         │                                    │   │
+│  │   - 实时关节状态读取 ⭐        │         │                                    │   │
 │  └───────────────────────────────┘         └───────────────────────────────────┘   │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
@@ -40,6 +41,8 @@
 - ✅ **Client 动态配置** (Server 以空闲模式启动)
 - ✅ **两阶段控制** (路径规划 + 实时控制)
 - ✅ **ROS 相机集成** (AstribotCameraSubscriber)
+- ✅ **实时关节状态读取** ⭐ (从机器人本体获取真实反馈)
+- ✅ **数据集驱动的初始位置** ⭐ (基于数据集统计的准备位置)
 
 ## 数据流
 
@@ -50,18 +53,19 @@
 │                                                                                    │
 │   Client                              gRPC                              Server     │
 │                                                                                    │
-│   ┌────────────────────────┐                                                       │
-│   │     Observation        │                                                       │
-│   │  ┌──────────────────┐  │                                                       │
-│   │  │ state (22/25维)  │  │  ← 本体状态 (关节角度)                                 │
-│   │  └──────────────────┘  │    维度由 state_includes_chassis 控制                  │
-│   │  ┌──────────────────┐  │                                                       │
-│   │  │ images[]         │  │  ← 观测图像 (JPEG)                                     │
-│   │  │  • head          │  │                                                       │
-│   │  │  • wrist_left    │  │                                                       │
-│   │  │  • wrist_right   │  │                                                       │
-│   │  └──────────────────┘  │                                                       │
-│   └────────────────────────┘                                                       │
+│   ┌────────────────────────────┐                                                   │
+│   │     Observation            │                                                   │
+│   │  ┌──────────────────────┐  │                                                   │
+│   │  │ state (22/25维)      │  │  ← 从机器人本体实时读取 ⭐                         │
+│   │  │ (真实关节反馈)        │  │    astribot.get_current_joints_position()        │
+│   │  └──────────────────────┘  │                                                   │
+│   │  ┌──────────────────────┐  │                                                   │
+│   │  │ images[]             │  │  ← 观测图像 (JPEG)                                │
+│   │  │  • head              │  │                                                   │
+│   │  │  • wrist_left        │  │                                                   │
+│   │  │  • wrist_right       │  │                                                   │
+│   │  └──────────────────────┘  │                                                   │
+│   └────────────────────────────┘                                                   │
 │              │                                                                     │
 │              │  Predict()                                                          │
 │              ▼                                                                     │
@@ -82,6 +86,55 @@
 │                                                                                    │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+## 关节状态读取 ⭐ 新功能
+
+### 数据来源
+
+`get_current_joint_positions()` 方法会**优先从机器人本体读取真实的关节反馈**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          关节状态获取流程                                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   get_current_joint_positions()                                                     │
+│          │                                                                          │
+│          ▼                                                                          │
+│   ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│   │  [优先] Astribot SDK 可用?                                                   │   │
+│   │         │                                                                   │   │
+│   │         ├─ YES ──► astribot.get_current_joints_position()                   │   │
+│   │         │          从机器人本体读取真实关节反馈:                               │   │
+│   │         │          • astribot_torso (4)                                     │   │
+│   │         │          • astribot_arm_left (7)                                  │   │
+│   │         │          • astribot_gripper_left (1)                              │   │
+│   │         │          • astribot_arm_right (7)                                 │   │
+│   │         │          • astribot_gripper_right (1)                             │   │
+│   │         │          • astribot_head (2)                                      │   │
+│   │         │          • astribot_chassis (3) [可选]                            │   │
+│   │         │                                                                   │   │
+│   │         └─ NO ───► 回退: 使用追踪的命令位置 (_current_waypoint)              │   │
+│   │                    或返回零向量                                              │   │
+│   └─────────────────────────────────────────────────────────────────────────────┘   │
+│          │                                                                          │
+│          ▼                                                                          │
+│   waypoint_to_lerobot_action() 格式转换                                             │
+│          │                                                                          │
+│          ▼                                                                          │
+│   返回 22/25 维 state 向量 (LeRobot 格式)                                           │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 优势
+
+| 项目 | 旧方式 (追踪命令) | 新方式 (实时读取) |
+|------|-------------------|-------------------|
+| 数据来源 | 上一帧发送的目标位置 | 机器人本体真实反馈 |
+| 误差感知 | ❌ 无法感知 | ✅ 可感知实际位置偏差 |
+| 控制精度 | 开环控制 | 闭环控制 |
+| 初始状态 | 需要先执行动作才有值 | 随时可读取真实状态 |
 
 ## 维度配置 (重要)
 
@@ -114,6 +167,38 @@
 │ arm_left(7) │ arm_right(7) │ gripper_L(1) │ gripper_R(1) │ head(2) │ torso(4) │ chassis(3) │
 └──────────────────────────────────────────────────────────────────────────────────┘
      0-6           7-13            14             15          16-17      18-21       22-24
+```
+
+## 准备位置 (Ready Position)
+
+准备位置定义在 `src/common/constants.py` 中，基于 **astribot_catlitter_datasets 数据集 200 个 episode 第一帧状态的均值** 计算得出。
+
+### READY_POSITION_22 (22维，不含底盘)
+
+```python
+READY_POSITION_22 = [
+    # arm_left (7)
+    0.154849, -0.022670, -1.421605, 1.660323, -0.346889, 0.115219, 0.126036,
+    # arm_right (7)
+    -0.161952, -0.022760, 1.418778, 1.660055, 0.343307, 0.115222, -0.123617,
+    # gripper_left (1)
+    -0.021181,
+    # gripper_right (1)
+    -0.121321,
+    # head (2)
+    -0.013063, 0.786349,
+    # torso (4)
+    0.597646, -1.195333, 0.597043, 0.009469,
+]
+```
+
+### READY_POSITION_25 (25维，含底盘)
+
+```python
+READY_POSITION_25 = READY_POSITION_22 + [
+    # chassis (3)
+    -0.000426, 0.002229, -0.069377,
+]
 ```
 
 ## 快速开始
@@ -408,7 +493,9 @@ controller.move_to_ready_position(duration=5.0)
 
 # 实时控制循环
 while True:
-    if not controller.step():  # step() 会发送 state + images
+    # step() 内部调用 get_current_joint_positions()
+    # 会从机器人本体读取真实关节状态 ⭐
+    if not controller.step():
         break
     time.sleep(1.0 / 30)
 
@@ -509,6 +596,7 @@ client.close()
 │  ║  阶段 1: 移动到准备位置 (Ready Position)                                   ║  │
 │  ║                                                                         ║  │
 │  ║  • 使用预设的 READY_POSITION_22/25 (constants.py)                       ║  │
+│  ║  • 基于数据集统计的初始位置均值 ⭐                                        ║  │
 │  ║  • 使用 move_joints_waypoints() 轨迹规划                                ║  │
 │  ║  • 耗时: ready_duration 秒 (默认 5.0s)                                  ║  │
 │  ╚═════════════════════════════════════════════════════════════════════════╝  │
@@ -518,7 +606,7 @@ client.close()
 │  ║  阶段 2: 实时控制 (Real-time)                                             ║  │
 │  ║                                                                         ║  │
 │  ║  循环 @ control_freq Hz:                                                 ║  │
-│  ║    1. 获取当前关节位置 (state)                                            ║  │
+│  ║    1. 获取当前关节位置 (从机器人本体实时读取) ⭐                            ║  │
 │  ║    2. 获取相机图像 (images) - 如果启用                                    ║  │
 │  ║    3. 发送 Predict 请求 (state + images)                                 ║  │
 │  ║    4. 应用速度限制 (VelocityLimiter)                                     ║  │
@@ -543,15 +631,33 @@ lerobot_grpc_inference/
 │   ├── server/                     # Server 端代码
 │   │   └── inference_server.py    # gRPC 服务, DatasetLoader, ModelInference
 │   ├── client/                     # Client 端代码
-│   │   └── inference_client.py    # InferenceClient, AstribotController, CameraSubscriber
+│   │   ├── inference_client.py    # InferenceClient, AstribotController, CameraSubscriber
+│   │   └── inference_logger.py    # 推理日志记录
 │   └── generated/                  # 自动生成的 gRPC 代码
 ├── scripts/                        # 脚本
 │   ├── generate_proto.sh          # 生成 gRPC 代码
 │   ├── run_server.sh              # 启动 Server
 │   └── run_client.sh              # 启动 Client
+├── inference_logs/                 # 推理日志输出目录
 ├── requirements.txt
 └── README.md
 ```
+
+## 更新日志
+
+### v1.1.0 (2026-01-10)
+
+- ⭐ **实时关节状态读取**: `get_current_joint_positions()` 现在从机器人本体实时读取真实关节反馈，而非追踪发送的命令
+- ⭐ **数据集驱动的初始位置**: `READY_POSITION_22/25` 更新为 astribot_catlitter_datasets 200个episode第一帧状态的均值
+- 改进: 添加回退机制 - SDK 不可用时自动回退到追踪模式
+
+### v1.0.0
+
+- 初始版本
+- V2.0 数据格式支持 (22/25维)
+- gRPC 推理接口
+- Action Chunking 支持
+- 两阶段控制流程
 
 ## 许可证
 

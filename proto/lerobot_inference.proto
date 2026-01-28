@@ -133,14 +133,11 @@ message ActionOutputConfig {
 
 // 策略配置 - Client 端发送给 Server 端
 message PolicyConfig {
-    // 模式: "model" 或 "dataset"
+    // 模式: "model"
     string mode = 1;
     
-    // 模型路径或 HuggingFace repo id (mode="model" 时使用)
+    // 模型路径或 HuggingFace repo id
     string model_path = 2;
-    
-    // 数据集路径 (mode="dataset" 时使用)
-    string dataset_path = 3;
     
     // 推理设备 ("cuda", "cpu", "mps")
     string device = 4;

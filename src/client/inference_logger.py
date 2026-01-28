@@ -61,15 +61,26 @@ logger = logging.getLogger("lerobot_inference.client.logger")
 
 @dataclass
 class InferenceLogEntry:
-    """单步推理日志条目"""
-    timestamp: float                    # Unix 时间戳
-    episode_id: int                     # Episode ID
-    frame_index: int                    # 帧索引
-    state: List[float]                  # 关节状态
-    action: List[float]                 # 推理输出的 action
-    image_paths: Dict[str, str]         # 图像文件路径 {camera_name: path}
-    latency_ms: Optional[float] = None  # 推理延迟 (毫秒)
-    extra_info: Optional[Dict] = None   # 额外信息
+    """
+    单步推理日志条目
+
+    记录完整的 action 处理流水线:
+      raw_action   -> filtered_action -> smoothed_action -> final_action
+      (模型输出)      (部件过滤)         (平滑+限速)        (发给机器人)
+
+    若某阶段未改变 action，对应字段为 None，节省存储空间。
+    """
+    timestamp: float                            # Unix 时间戳
+    episode_id: int                             # Episode ID
+    frame_index: int                            # 帧索引
+    state: List[float]                          # 关节状态 (输入)
+    action: List[float]                         # 最终发给机器人的 action
+    image_paths: Dict[str, str]                 # 图像文件路径 {camera_name: path}
+    latency_ms: Optional[float] = None          # 推理延迟 (毫秒)
+    raw_action: Optional[List[float]] = None    # 模型原始输出 (与 action 不同时才记录)
+    filtered_action: Optional[List[float]] = None  # 部件过滤后 (与 raw/final 不同时才记录)
+    smoothed_action: Optional[List[float]] = None  # 平滑/限速后 (与 filtered/final 不同时才记录)
+    extra_info: Optional[Dict] = None           # 额外信息
 
 
 class InferenceLogger:
@@ -136,7 +147,6 @@ class InferenceLogger:
         self,
         episode_id: int = 0,
         model_path: Optional[str] = None,
-        dataset_path: Optional[str] = None,
         config: Optional[Dict] = None,
         **extra_metadata
     ):
@@ -146,7 +156,6 @@ class InferenceLogger:
         Args:
             episode_id: Episode ID
             model_path: 模型路径
-            dataset_path: 数据集路径
             config: 配置信息
             **extra_metadata: 额外的元信息
         """
@@ -165,7 +174,6 @@ class InferenceLogger:
             "start_timestamp": time.time(),
             "episode_id": episode_id,
             "model_path": model_path,
-            "dataset_path": dataset_path,
             "config": config or {},
             "save_images": self.save_images,
             "image_format": self.image_format,
@@ -196,41 +204,67 @@ class InferenceLogger:
         images: Optional[List[Dict]] = None,
         episode_id: int = 0,
         latency_ms: Optional[float] = None,
+        raw_action: Optional[List[float]] = None,
+        filtered_action: Optional[List[float]] = None,
+        smoothed_action: Optional[List[float]] = None,
         extra_info: Optional[Dict] = None,
         save_images_this_step: bool = True
     ):
         """
         记录单步推理信息
-        
+
+        记录完整的 action 处理流水线:
+          raw_action -> filtered_action -> smoothed_action -> action (final)
+
+        为节省存储，当某阶段输出与最终 action 相同时，该字段记录为 None。
+
         Args:
             frame_index: 帧索引
             state: 关节状态 (float list)
-            action: 推理输出的 action (float list)
+            action: 最终发给机器人的 action (float list)
             images: 图像列表 (与 predict() 使用的格式相同)
                     [{'name': 'head', 'data': bytes, ...}, ...]
             episode_id: Episode ID
             latency_ms: 推理延迟 (毫秒)
+            raw_action: 模型原始输出 (与 action 不同时传入)
+            filtered_action: 部件过滤后的 action (与 action 不同时传入)
+            smoothed_action: 平滑/限速后的 action (与 action 不同时传入)
             extra_info: 额外信息
             save_images_this_step: 是否在当前步保存图像 (默认 True)
                                    设为 False 可仅记录数据而不保存图像
         """
         if not self.enabled or not self._session_started:
             return
-        
+
         # 保存图像 (只有当 save_images 和 save_images_this_step 都为 True 时才保存)
         image_paths = {}
         if self.save_images and images and save_images_this_step:
             image_paths = self._save_images(frame_index, images)
-        
+
+        def _to_list(v):
+            if v is None:
+                return None
+            return list(v) if isinstance(v, np.ndarray) else list(v)
+
+        final_action = _to_list(action)
+
+        # 只记录与 final_action 不同的中间结果，节省存储
+        raw_list = _to_list(raw_action)
+        filtered_list = _to_list(filtered_action)
+        smoothed_list = _to_list(smoothed_action)
+
         # 构建日志条目
         entry = InferenceLogEntry(
             timestamp=time.time(),
             episode_id=episode_id,
             frame_index=frame_index,
             state=list(state) if isinstance(state, np.ndarray) else state,
-            action=list(action) if isinstance(action, np.ndarray) else action,
+            action=final_action,
             image_paths=image_paths,
             latency_ms=latency_ms,
+            raw_action=raw_list if raw_list != final_action else None,
+            filtered_action=filtered_list if filtered_list != final_action else None,
+            smoothed_action=smoothed_list if smoothed_list != final_action else None,
             extra_info=extra_info
         )
         
@@ -446,7 +480,7 @@ class InferenceLogReader:
     def load_as_arrays(self) -> tuple:
         """
         将 state 和 action 加载为 numpy 数组
-        
+
         Returns:
             (states, actions): numpy 数组元组
                 states: shape (N, state_dim)
@@ -454,12 +488,62 @@ class InferenceLogReader:
         """
         states = []
         actions = []
-        
+
         for entry in self.iter_entries():
             states.append(entry['state'])
             actions.append(entry['action'])
-        
+
         return np.array(states), np.array(actions)
+
+    def load_action_pipeline(self) -> Dict[str, np.ndarray]:
+        """
+        加载完整的 action 处理流水线数据
+
+        Returns:
+            dict 包含:
+                "state": shape (N, state_dim)
+                "raw_action": shape (N, action_dim) — 模型原始输出
+                "filtered_action": shape (N, action_dim) — 部件过滤后
+                "smoothed_action": shape (N, action_dim) — 平滑/限速后
+                "final_action": shape (N, action_dim) — 最终发给机器人
+
+            若某阶段与 final_action 相同，该阶段数组内容等于 final_action。
+        """
+        finals = []
+        raws = []
+        filtereds = []
+        smootheds = []
+        states = []
+
+        for entry in self.iter_entries():
+            final = entry['action']
+            finals.append(final)
+            states.append(entry['state'])
+            # 若中间字段为 None，说明与 final 相同
+            raws.append(entry.get('raw_action') or final)
+            filtereds.append(entry.get('filtered_action') or final)
+            smootheds.append(entry.get('smoothed_action') or final)
+
+        return {
+            "state": np.array(states),
+            "raw_action": np.array(raws),
+            "filtered_action": np.array(filtereds),
+            "smoothed_action": np.array(smootheds),
+            "final_action": np.array(finals),
+        }
+
+    def load_latencies(self) -> np.ndarray:
+        """
+        加载所有帧的推理延迟
+
+        Returns:
+            shape (N,) 的 numpy 数组 (毫秒)，None 值填充为 NaN
+        """
+        latencies = []
+        for entry in self.iter_entries():
+            v = entry.get('latency_ms')
+            latencies.append(v if v is not None else float('nan'))
+        return np.array(latencies)
     
     def get_image_path(self, frame_index: int, camera_name: str) -> Optional[str]:
         """
@@ -537,7 +621,6 @@ def list_sessions(log_dir: str = "./inference_logs") -> List[Dict]:
                     "total_frames": metadata.get("total_frames", 0),
                     "duration_seconds": metadata.get("duration_seconds", 0),
                     "model_path": metadata.get("model_path"),
-                    "dataset_path": metadata.get("dataset_path"),
                 })
             except Exception as e:
                 logger.warning(f"读取会话元信息失败 [{name}]: {e}")

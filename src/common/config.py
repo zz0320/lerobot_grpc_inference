@@ -19,45 +19,31 @@ from .constants import (
 class ActionConfig:
     """
     Action 配置
-    
+
     分离三个概念:
     1. state_dim: 输入 state 的维度 (22 或 25)，由机器人状态采集决定
     2. action_dim: 模型/数据集输出的 action 维度 (22 或 25)，由训练时决定
-    3. execute_chassis: 执行时是否控制底盘 (只影响发送给机器人的命令)
+    3. enable_chassis: 执行时是否控制底盘 (只影响发送给机器人的命令)
+
+    字段命名与 proto ActionOutputConfig 保持一致 (enable_*)
     """
     # ========== 输入配置 ==========
     # 输入 state 是否包含底盘 (影响 Client 采集的状态维度)
     state_includes_chassis: bool = False
-    
+
     # ========== 执行配置 ==========
     # 执行 action 时是否控制底盘 (即使 action 有 25 维，也可以选择不执行底盘)
-    execute_chassis: bool = False
-    # 是否执行头部控制
-    execute_head: bool = True
-    # 是否执行腰部控制
-    execute_torso: bool = True
-    
+    enable_chassis: bool = False
+    # 是否启用头部控制
+    enable_head: bool = True
+    # 是否启用腰部控制
+    enable_torso: bool = True
+
     @property
     def state_dim(self) -> int:
         """输入 state 维度"""
         # 基础: arm_left(7) + arm_right(7) + gripper_left(1) + gripper_right(1) + head(2) + torso(4) = 22
         return 25 if self.state_includes_chassis else 22
-    
-    # ========== 兼容旧接口 ==========
-    @property
-    def enable_chassis(self) -> bool:
-        """兼容旧接口"""
-        return self.execute_chassis
-    
-    @property
-    def enable_head(self) -> bool:
-        """兼容旧接口"""
-        return self.execute_head
-    
-    @property
-    def enable_torso(self) -> bool:
-        """兼容旧接口"""
-        return self.execute_torso
 
 
 @dataclass
@@ -90,7 +76,6 @@ class ClientConfig:
     
     # 策略配置 (Client 端指定)
     model_path: Optional[str] = None  # 模型路径或 HuggingFace repo id
-    dataset_path: Optional[str] = None  # 数据集路径 (回放模式)
     device: str = "cuda"  # 推理设备
     policy_type: Optional[str] = None  # 策略类型 (可选)
     
@@ -114,6 +99,4 @@ class ClientConfig:
         """推理模式"""
         if self.model_path:
             return "model"
-        elif self.dataset_path:
-            return "dataset"
         return "none"

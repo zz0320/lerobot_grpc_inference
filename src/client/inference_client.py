@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-LeRobot 推理客户端 (精简版)
+LeRobot 推理客户端
 运行环境: 机器人侧 (Astribot SDK 环境)
 
 通过 gRPC 连接远程推理服务器获取 action
-配置方式: Client 连接时通过 Configure() 指定模型/数据集
+配置方式: Client 连接时通过 Configure() 指定模型
 
 支持推理日志记录:
     启用 --enable-logging 参数可记录全部推理信息 (state, action, image)
@@ -27,26 +27,16 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 sys.path.insert(0, PROJECT_ROOT)
 
 # 导入生成的 protobuf 代码
-try:
-    from src.generated import lerobot_inference_pb2 as pb2
-    from src.generated import lerobot_inference_pb2_grpc as pb2_grpc
-except ImportError:
-    try:
-        from generated import lerobot_inference_pb2 as pb2
-        from generated import lerobot_inference_pb2_grpc as pb2_grpc
-    except ImportError:
-        pb2 = None
-        pb2_grpc = None
-        print("警告: 未找到 protobuf 生成文件，请先运行 scripts/generate_proto.sh")
+from src.common.proto_imports import pb2, pb2_grpc
 
 # 导入通用模块
 from src.common.config import ClientConfig, ActionConfig
 from src.common.utils import (
-    setup_logging, 
-    ActionSmoother, 
+    setup_logging,
+    ActionSmoother,
     VelocityLimiter,
     lerobot_action_to_waypoint,
-    binarize_gripper_action
+    filter_action,
 )
 from src.common.constants import (
     ASTRIBOT_NAMES_LIST,
@@ -55,6 +45,8 @@ from src.common.constants import (
     LEROBOT_ACTION_DIM_NO_CHASSIS,
     LEROBOT_ACTION_DIM_WITH_CHASSIS,
     GRPC_MAX_MESSAGE_LENGTH,
+    GRPC_KEEPALIVE_TIME_MS,
+    GRPC_KEEPALIVE_TIMEOUT_MS,
     READY_POSITION_22,
     READY_POSITION_25,
 )
@@ -521,8 +513,8 @@ class InferenceClient:
             options=[
                 ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_LENGTH),
                 ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_LENGTH),
-                ('grpc.keepalive_time_ms', 10000),
-                ('grpc.keepalive_timeout_ms', 5000),
+                ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_TIME_MS),
+                ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_TIMEOUT_MS),
             ]
         )
         self.stub = pb2_grpc.LeRobotInferenceServiceStub(self.channel)
@@ -546,18 +538,16 @@ class InferenceClient:
         self,
         mode: str,
         model_path: str = "",
-        dataset_path: str = "",
         device: str = "cuda",
         policy_type: str = "",
         action_config: Optional[ActionConfig] = None
     ) -> "pb2.ServiceStatus":
         """
-        配置 Server 使用的模型/数据集
+        配置 Server 使用的模型
         
         Args:
-            mode: "model" 或 "dataset"
-            model_path: 模型路径或 HuggingFace repo id (mode="model" 时)
-            dataset_path: 数据集路径 (mode="dataset" 时)
+            mode: "model"
+            model_path: 模型路径或 HuggingFace repo id
             device: 推理设备
             policy_type: 策略类型 (可选)
             action_config: Action 输出配置
@@ -565,7 +555,6 @@ class InferenceClient:
         config = pb2.PolicyConfig(
             mode=mode,
             model_path=model_path,
-            dataset_path=dataset_path,
             device=device,
             policy_type=policy_type
         )
@@ -646,6 +635,47 @@ class InferenceClient:
             'encoding': encoding
         }
     
+    def _build_observation(
+        self,
+        joint_positions: List[float],
+        episode_id: int = 0,
+        frame_index: int = 0,
+        images: Optional[List[dict]] = None,
+        extra_state: str = ""
+    ) -> "pb2.Observation":
+        """
+        构建 protobuf Observation 消息
+
+        Args:
+            joint_positions: 当前关节位置
+            episode_id: episode 索引
+            frame_index: 帧索引
+            images: 图像列表 (由 encode_image() 编码)
+            extra_state: 额外状态信息 (JSON)
+
+        Returns:
+            pb2.Observation protobuf 消息
+        """
+        obs = pb2.Observation(
+            joint_positions=joint_positions,
+            timestamp=time.time(),
+            episode_id=episode_id,
+            frame_index=frame_index,
+            extra_state=extra_state
+        )
+
+        if images:
+            for img in images:
+                obs.images.append(pb2.ImageData(
+                    camera_name=img.get('name', 'cam'),
+                    data=img.get('data', b''),
+                    width=img.get('width', 0),
+                    height=img.get('height', 0),
+                    encoding=img.get('encoding', 'jpeg')
+                ))
+
+        return obs
+
     def predict(
         self,
         joint_positions: List[float],
@@ -656,46 +686,29 @@ class InferenceClient:
     ) -> "pb2.Action":
         """
         单次推理
-        
+
         Args:
             joint_positions: 当前关节位置
             episode_id: episode 索引
             frame_index: 帧索引
             images: 图像列表，使用 encode_image() 编码
             extra_state: 额外状态信息 (JSON)
-        
+
         Returns:
             Action 响应
-            
+
         Example:
             >>> # 不带图像
             >>> action = client.predict(joint_positions=[0.0] * 22)
-            >>> 
+            >>>
             >>> # 带图像
             >>> img_left = client.encode_image(cam_left_frame, "cam_left")
             >>> img_right = client.encode_image(cam_right_frame, "cam_right")
             >>> action = client.predict(joint_positions, images=[img_left, img_right])
         """
-        obs = pb2.Observation(
-            joint_positions=joint_positions,
-            timestamp=time.time(),
-            episode_id=episode_id,
-            frame_index=frame_index,
-            extra_state=extra_state
-        )
-        
-        if images:
-            for img in images:
-                obs.images.append(pb2.ImageData(
-                    camera_name=img.get('name', 'cam'),
-                    data=img.get('data', b''),
-                    width=img.get('width', 0),
-                    height=img.get('height', 0),
-                    encoding=img.get('encoding', 'jpeg')
-                ))
-        
+        obs = self._build_observation(joint_positions, episode_id, frame_index, images, extra_state)
         return self.stub.Predict(obs)
-    
+
     def predict_chunk(
         self,
         joint_positions: List[float],
@@ -706,48 +719,31 @@ class InferenceClient:
     ) -> "pb2.ActionChunk":
         """
         Chunk 推理 - 一次性获取完整的 action chunk
-        
+
         适用于 action chunking 策略 (ACT, Diffusion 等)
         Server 返回完整的 action chunk，Client 在本地消费
-        
+
         Args:
             joint_positions: 当前关节位置
             episode_id: episode 索引
             frame_index: 帧索引 (chunk 的起始帧)
             images: 图像列表，使用 encode_image() 编码
             extra_state: 额外状态信息 (JSON)
-        
+
         Returns:
             ActionChunk 响应，包含多个 action
-            
+
         Example:
             >>> # 获取 action chunk
             >>> chunk = client.predict_chunk(joint_positions=[0.0] * 22, frame_index=0)
             >>> print(f"Chunk size: {chunk.chunk_size}, Action dim: {chunk.action_dim}")
-            >>> 
+            >>>
             >>> # 逐步消费 chunk 中的 action
             >>> for action_step in chunk.actions:
             ...     action = list(action_step.values)
             ...     # 发送到机器人...
         """
-        obs = pb2.Observation(
-            joint_positions=joint_positions,
-            timestamp=time.time(),
-            episode_id=episode_id,
-            frame_index=frame_index,
-            extra_state=extra_state
-        )
-        
-        if images:
-            for img in images:
-                obs.images.append(pb2.ImageData(
-                    camera_name=img.get('name', 'cam'),
-                    data=img.get('data', b''),
-                    width=img.get('width', 0),
-                    height=img.get('height', 0),
-                    encoding=img.get('encoding', 'jpeg')
-                ))
-        
+        obs = self._build_observation(joint_positions, episode_id, frame_index, images, extra_state)
         return self.stub.PredictChunk(obs)
     
     def stream_predict(
@@ -814,12 +810,10 @@ class AstribotController:
         use_chunk: bool = False,
         n_action_steps: Optional[int] = None,
         inference_logger: Optional[InferenceLogger] = None,
-        binarize_gripper: bool = False,
-        gripper_threshold: float = 80.0
     ):
         """
         初始化控制器
-        
+
         Args:
             config: 客户端配置
             enable_camera: 是否启用相机订阅 (用于视觉策略)
@@ -827,8 +821,6 @@ class AstribotController:
             use_chunk: 是否使用 chunk 模式
             n_action_steps: chunk 模式下每个 chunk 使用的 action 数量
             inference_logger: 推理日志记录器
-            binarize_gripper: 是否启用夹爪二值化控制 (0/100)
-            gripper_threshold: 夹爪二值化阈值 (默认 80.0)
         """
         self.config = config
         self._use_chunk = use_chunk
@@ -836,18 +828,12 @@ class AstribotController:
         
         # 推理日志记录器
         self.inference_logger = inference_logger
-        
-        # 夹爪二值化配置
-        self._binarize_gripper = binarize_gripper
-        self._gripper_threshold = gripper_threshold
-        
+
         logger.info(f"初始化 AstribotController")
         logger.info(f"  - 服务器: {config.server_address}")
         logger.info(f"  - 控制频率: {config.control_freq} Hz")
         logger.info(f"  - 推理模式: {'Chunk' if use_chunk else '单步'}")
         logger.info(f"  - 推理日志: {'启用' if inference_logger else '禁用'}")
-        if binarize_gripper:
-            logger.info(f"  - 夹爪二值化: 启用 (阈值={gripper_threshold})")
         
         # 初始化推理客户端
         self.inference_client = InferenceClient(
@@ -904,7 +890,9 @@ class AstribotController:
         
         # 维度配置 (分离输入和执行)
         self._state_includes_chassis = self.config.action_config.state_includes_chassis  # 输入 state 是否含底盘
-        self._execute_chassis = self.config.action_config.execute_chassis  # 执行时是否控制底盘
+        self._enable_chassis = self.config.action_config.enable_chassis  # 执行时是否控制底盘
+        self._enable_head = self.config.action_config.enable_head        # 是否控制头部
+        self._enable_torso = self.config.action_config.enable_torso      # 是否控制腰部
         
         # Chunk 模式管理器
         self._chunk_manager: Optional[ActionChunkManager] = None
@@ -917,7 +905,7 @@ class AstribotController:
             logger.info(f"  - Chunk 模式: n_action_steps={self._n_action_steps}")
         
         logger.info(f"  - 输入 state 维度: {22 if not self._state_includes_chassis else 25}")
-        logger.info(f"  - 执行底盘控制: {self._execute_chassis}")
+        logger.info(f"  - 执行底盘控制: {self._enable_chassis}")
         
         # 初始过渡配置 (用于平滑过渡到第一帧 action，避免初始跳变)
         self._initial_transition_duration = 0.0  # 默认不执行过渡
@@ -927,15 +915,39 @@ class AstribotController:
         根据配置获取正确的部件名称列表
         
         Args:
-            include_chassis: 是否包含底盘，None 表示使用 _execute_chassis 配置
+            include_chassis: 是否包含底盘，None 表示使用 _enable_chassis 配置
         """
-        use_chassis = include_chassis if include_chassis is not None else self._execute_chassis
+        use_chassis = include_chassis if include_chassis is not None else self._enable_chassis
         if use_chassis:
             return ASTRIBOT_NAMES_LIST_WITH_CHASSIS
         return ASTRIBOT_NAMES_LIST
-    
+
+    def _apply_action_filter(self, action, current_state=None):
+        """
+        根据 enable_head/torso/chassis 配置过滤 action
+
+        禁用的部件使用当前关节状态替代模型输出。
+        此过滤在 Client 端执行，Server 始终返回模型原始输出。
+
+        Args:
+            action: 模型原始 action (list 或 np.ndarray)
+            current_state: 当前关节状态 (list，用于保持禁用部件值)
+
+        Returns:
+            过滤后的 action (list)
+        """
+        action_arr = np.array(action, dtype=np.float32)
+        state_arr = np.array(current_state, dtype=np.float32) if current_state is not None else None
+        filtered = filter_action(
+            action_arr, state_arr,
+            enable_head=self._enable_head,
+            enable_torso=self._enable_torso,
+            enable_chassis=self._enable_chassis,
+        )
+        return filtered.tolist()
+
     def _configure_server(self):
-        """配置 Server 端使用的模型/数据集"""
+        """配置 Server 端使用的模型"""
         if self.config.model_path:
             logger.info(f"配置 Server 使用模型: {self.config.model_path}")
             status = self.inference_client.configure(
@@ -946,22 +958,12 @@ class AstribotController:
                 action_config=self.config.action_config
             )
             logger.info(f"Server 配置结果: {status.message}")
-            
-        elif self.config.dataset_path:
-            logger.info(f"配置 Server 使用数据集: {self.config.dataset_path}")
-            status = self.inference_client.configure(
-                mode="dataset",
-                dataset_path=self.config.dataset_path,
-                action_config=self.config.action_config
-            )
-            logger.info(f"Server 配置结果: {status.message}")
-            
         else:
             status = self.inference_client.get_status()
             if status.is_ready:
                 logger.info(f"Server 已就绪，模式: {status.mode}")
             else:
-                logger.warning("未指定模型或数据集，且 Server 未就绪")
+                logger.warning("未指定模型，且 Server 未就绪")
     
     def get_current_joint_positions(self) -> List[float]:
         """
@@ -1053,7 +1055,7 @@ class AstribotController:
         logger.info("=" * 60)
         
         # 选择准备位置 (根据是否控制底盘)
-        if self._execute_chassis:
+        if self._enable_chassis:
             ready_position = READY_POSITION_25
             logger.info("使用 25 维准备位置 (含底盘)")
         else:
@@ -1066,7 +1068,7 @@ class AstribotController:
         # 转换为 waypoint
         waypoint = lerobot_action_to_waypoint(
             ready_position, 
-            include_chassis=self._execute_chassis
+            include_chassis=self._enable_chassis
         )
         
         # 执行路径规划
@@ -1113,11 +1115,11 @@ class AstribotController:
         
         logger.info(f"路径规划执行 {len(actions)} 个路径点...")
         logger.info(f"  - Action 维度: {len(actions[0])} (含底盘: {action_has_chassis})")
-        logger.info(f"  - 执行底盘控制: {self._execute_chassis}")
+        logger.info(f"  - 执行底盘控制: {self._enable_chassis}")
         
-        # 转换为 waypoint (根据 execute_chassis 决定)
+        # 转换为 waypoint (根据 enable_chassis 决定)
         waypoints = [
-            lerobot_action_to_waypoint(a, include_chassis=self._execute_chassis) 
+            lerobot_action_to_waypoint(a, include_chassis=self._enable_chassis) 
             for a in actions
         ]
         
@@ -1211,39 +1213,49 @@ class AstribotController:
         
         # 计算推理延迟
         inference_latency_ms = (time.time() - inference_start_time) * 1000
-        
-        # 记录推理日志 (在应用后处理之前记录原始 action)
-        # 只有推理帧才保存图像，但所有帧都记录数据
+
+        # ========== Action 处理流水线 ==========
+        # 阶段 0: 模型原始输出
+        raw_action = list(action) if not isinstance(action, list) else list(action)
+
+        # 阶段 1: 部件过滤 (head/torso/chassis)
+        action = self._apply_action_filter(action, current_state=joint_positions)
+        filtered_action = list(action)
+
+        # 阶段 2: 速度限制
+        if self.velocity_limiter:
+            action = self.velocity_limiter.limit(action)
+
+        # 阶段 3: 平滑
+        if self.smoother:
+            action = self.smoother.smooth(action)
+
+        # 阶段 2+3 合并为 smoothed (限速 + 平滑后)
+        smoothed_action = list(action) if (self.velocity_limiter or self.smoother) else None
+
+        # 最终 action (发给机器人)
+        final_action = action
+
+        # 记录完整的 action 处理流水线
         if self.inference_logger:
             self.inference_logger.log_step(
                 frame_index=self._frame_index,
                 state=joint_positions,
-                action=action,
+                action=final_action,
                 images=images,
                 episode_id=self._episode_id,
                 latency_ms=inference_latency_ms,
+                raw_action=raw_action,
+                filtered_action=filtered_action,
+                smoothed_action=smoothed_action,
                 extra_info={
-                    "use_chunk": self._use_chunk,
-                    "control_freq": self.control_freq,
-                    "is_inference_frame": is_inference_frame
+                    "is_inference_frame": is_inference_frame,
                 },
                 save_images_this_step=is_inference_frame
             )
-        
-        # 应用速度限制
-        if self.velocity_limiter:
-            action = self.velocity_limiter.limit(action)
-        
-        # 应用平滑
-        if self.smoother:
-            action = self.smoother.smooth(action)
-        
-        # 应用夹爪二值化 (0/100 控制)
-        if self._binarize_gripper:
-            action = binarize_gripper_action(action, threshold=self._gripper_threshold)
-        
-        # 发送到机器人 (根据 execute_chassis 决定是否控制底盘)
-        waypoint = lerobot_action_to_waypoint(action, include_chassis=self._execute_chassis)
+
+        # 发送到机器人 (根据 enable_chassis 决定是否控制底盘)
+        waypoint = lerobot_action_to_waypoint(action, include_chassis=self._enable_chassis)
         
         if self.astribot:
             self.astribot.set_joints_position(
@@ -1340,6 +1352,9 @@ class AstribotController:
             # 重置服务端状态
             self.inference_client.reset()
         
+        # 应用部件过滤
+        first_action = self._apply_action_filter(first_action, current_state=joint_positions)
+
         # 计算跳变
         current_state = joint_positions[:len(first_action)]  # 截取相同维度
         max_diff = max(abs(a - s) for a, s in zip(first_action, current_state))
@@ -1348,7 +1363,7 @@ class AstribotController:
         # 使用路径规划平滑过渡
         logger.info(f"执行平滑过渡 ({self._initial_transition_duration}s)...")
         
-        waypoint = lerobot_action_to_waypoint(first_action, include_chassis=self._execute_chassis)
+        waypoint = lerobot_action_to_waypoint(first_action, include_chassis=self._enable_chassis)
         
         if self.astribot:
             self.astribot.move_joints_waypoints(
@@ -1411,7 +1426,6 @@ def run_inference_loop(
         controller.inference_logger.start_session(
             episode_id=episode,
             model_path=controller.config.model_path,
-            dataset_path=controller.config.dataset_path,
             config={
                 "control_freq": controller.config.control_freq,
                 "control_way": controller.config.control_way,
@@ -1419,6 +1433,10 @@ def run_inference_loop(
                 "max_velocity": controller.config.max_velocity,
                 "use_chunk": controller._use_chunk,
                 "n_action_steps": controller._n_action_steps,
+                "enable_head": controller._enable_head,
+                "enable_torso": controller._enable_torso,
+                "enable_chassis": controller._enable_chassis,
+                "state_includes_chassis": controller._state_includes_chassis,
             }
         )
     
@@ -1505,25 +1523,21 @@ def main():
     global _interrupted
     
     parser = argparse.ArgumentParser(
-        description='Astribot 推理控制客户端 (精简版)',
+        description='Astribot 推理控制客户端',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 使用数据集回放
-  python inference_client.py --server localhost:50051 \\
-      --dataset /path/to/lerobot_dataset --episode 0
-  
   # 使用模型推理
   python inference_client.py --server localhost:50051 \\
       --model /path/to/trained_model --device cuda
   
   # 启用底盘控制
   python inference_client.py --server localhost:50051 \\
-      --dataset /path/to/dataset --enable-chassis
+      --model /path/to/model --execute-chassis
   
   # 开启平滑
   python inference_client.py --server localhost:50051 \\
-      --dataset /path/to/dataset --smooth 5 --max-velocity 0.05
+      --model /path/to/model --smooth 5 --max-velocity 0.05
         """
     )
     
@@ -1536,8 +1550,6 @@ def main():
     # 策略配置
     parser.add_argument('--model', type=str, default=None,
                         help='模型路径或 HuggingFace repo id')
-    parser.add_argument('--dataset', type=str, default=None,
-                        help='数据集路径 (数据集回放模式)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='推理设备 (默认: cuda)')
     parser.add_argument('--policy-type', type=str, default=None,
@@ -1584,12 +1596,6 @@ def main():
     parser.add_argument('--n-action-steps', type=int, default=None,
                         help='Chunk 模式下每个 chunk 使用的 action 数量 (默认: 使用完整 chunk)')
     
-    # 夹爪二值化配置
-    parser.add_argument('--binarize-gripper', action='store_true',
-                        help='启用夹爪二值化控制: 超过阈值输出100，否则输出0')
-    parser.add_argument('--gripper-threshold', type=float, default=80.0,
-                        help='夹爪二值化阈值 (默认: 80.0)')
-    
     # 准备位置配置
     parser.add_argument('--move-to-ready', action='store_true', default=True,
                         help='启动时先移动到准备位置 (默认: 开启)')
@@ -1635,9 +1641,9 @@ def main():
     # 构建 Action 配置 (分离输入和执行)
     action_config = ActionConfig(
         state_includes_chassis=args.state_with_chassis,  # 输入 state 是否含底盘
-        execute_chassis=args.execute_chassis,            # 执行时是否控制底盘
-        execute_head=not args.no_head,
-        execute_torso=not args.no_torso
+        enable_chassis=args.execute_chassis,             # 执行时是否控制底盘
+        enable_head=not args.no_head,
+        enable_torso=not args.no_torso
     )
     
     # 构建配置
@@ -1646,7 +1652,6 @@ def main():
         server_port=port,
         timeout=args.timeout,
         model_path=args.model,
-        dataset_path=args.dataset,
         device=args.device,
         policy_type=args.policy_type,
         control_freq=args.control_freq,
@@ -1690,8 +1695,6 @@ def main():
             use_chunk=args.use_chunk,
             n_action_steps=args.n_action_steps,
             inference_logger=inference_logger,
-            binarize_gripper=args.binarize_gripper,
-            gripper_threshold=args.gripper_threshold
         )
         
         # 设置初始过渡 (解决初始跳变问题)

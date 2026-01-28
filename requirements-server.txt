@@ -3,14 +3,10 @@
 
 -r requirements.txt
 
-# 数据处理
-pandas>=1.5.0
-pyarrow>=10.0.0
-
-# 深度学习 (如果使用模型推理)
+# 深度学习
 torch>=2.0.0
 
-# LeRobot (如果使用模型推理)
+# LeRobot
 # lerobot  # 请根据实际情况安装
 
 

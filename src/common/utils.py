@@ -9,9 +9,8 @@ from typing import List, Optional
 import numpy as np
 
 from .constants import (
+    ACTION_INDEX_CONFIG,
     ARM_INDICES,
-    GRIPPER_LEFT_INDEX,
-    GRIPPER_RIGHT_INDEX,
     LEROBOT_ACTION_DIM_NO_CHASSIS,
     LEROBOT_ACTION_DIM_WITH_CHASSIS,
 )
@@ -124,43 +123,6 @@ class VelocityLimiter:
         self._last_action = None
 
 
-def binarize_gripper_action(
-    action: List[float],
-    threshold: float = 80.0,
-    high_value: float = 100.0,
-    low_value: float = 0.0
-) -> List[float]:
-    """
-    将夹爪控制二值化 (0/1 控制)
-    
-    当夹爪值超过阈值时设为 high_value，否则设为 low_value
-    
-    Args:
-        action: LeRobot action 数组 (22或25维)
-        threshold: 阈值 (默认 80.0)
-        high_value: 超过阈值时的值 (默认 100.0 = 完全闭合)
-        low_value: 低于阈值时的值 (默认 0.0 = 完全张开)
-        
-    Returns:
-        处理后的 action 数组
-        
-    Note:
-        - gripper_left 在索引 14
-        - gripper_right 在索引 15
-    """
-    action = list(action)  # 复制一份，避免修改原数组
-    
-    # 处理 gripper_left (索引 14)
-    if len(action) > GRIPPER_LEFT_INDEX:
-        action[GRIPPER_LEFT_INDEX] = high_value if action[GRIPPER_LEFT_INDEX] > threshold else low_value
-    
-    # 处理 gripper_right (索引 15)
-    if len(action) > GRIPPER_RIGHT_INDEX:
-        action[GRIPPER_RIGHT_INDEX] = high_value if action[GRIPPER_RIGHT_INDEX] > threshold else low_value
-    
-    return action
-
-
 def lerobot_action_to_waypoint(action: List[float], include_chassis: bool = False) -> List[List[float]]:
     """
     将 LeRobot V2.0 格式的 action 转换为 Astribot waypoint 格式
@@ -231,5 +193,82 @@ def waypoint_to_lerobot_action(waypoint: List[List[float]], include_chassis: boo
             # waypoint 没有底盘数据，补零
             chassis = [0.0, 0.0, 0.0]
         action = action + chassis
-    
+
     return action
+
+
+# ============================================================================
+# Action 过滤
+# ============================================================================
+
+def filter_action(
+    action: np.ndarray,
+    current_state: Optional[np.ndarray] = None,
+    enable_head: bool = True,
+    enable_torso: bool = True,
+    enable_chassis: bool = False,
+) -> np.ndarray:
+    """
+    根据部件启用配置过滤单步 action
+
+    禁用的部件使用 current_state 对应值替代 (若无则置零)。
+    enable_chassis=False 时截断为 22 维，否则保持 25 维。
+
+    Args:
+        action: 模型输出的原始 action (22或25 维)
+        current_state: 当前关节状态 (用于保持禁用部件的值)
+        enable_head: 是否启用头部
+        enable_torso: 是否启用腰部
+        enable_chassis: 是否启用底盘
+    """
+    if len(action) != LEROBOT_ACTION_DIM_WITH_CHASSIS:
+        # 非 25 维，无法按部件过滤，直接返回
+        return action
+
+    filtered = action.copy()
+
+    head_start, head_end = ACTION_INDEX_CONFIG['head']
+    torso_start, torso_end = ACTION_INDEX_CONFIG['torso']
+
+    if not enable_head:
+        if current_state is not None and len(current_state) >= head_end:
+            filtered[head_start:head_end] = current_state[head_start:head_end]
+        else:
+            filtered[head_start:head_end] = 0.0
+
+    if not enable_torso:
+        if current_state is not None and len(current_state) >= torso_end:
+            filtered[torso_start:torso_end] = current_state[torso_start:torso_end]
+        else:
+            filtered[torso_start:torso_end] = 0.0
+
+    if enable_chassis:
+        return filtered        # 25 维
+    else:
+        return filtered[:LEROBOT_ACTION_DIM_NO_CHASSIS]  # 22 维
+
+
+def filter_action_array(
+    actions: np.ndarray,
+    current_state: Optional[np.ndarray] = None,
+    enable_head: bool = True,
+    enable_torso: bool = True,
+    enable_chassis: bool = False,
+) -> np.ndarray:
+    """
+    对单步 action 或 action chunk 统一执行过滤
+
+    Args:
+        actions: shape (action_dim,) 单步, 或 (chunk_size, action_dim) chunk
+        current_state: 当前关节状态
+        enable_head/enable_torso/enable_chassis: 部件启用配置
+    """
+    kwargs = dict(current_state=current_state, enable_head=enable_head,
+                  enable_torso=enable_torso, enable_chassis=enable_chassis)
+    if actions.ndim == 1:
+        return filter_action(actions, **kwargs)
+    else:
+        if actions.shape[-1] == LEROBOT_ACTION_DIM_WITH_CHASSIS:
+            filtered = [filter_action(actions[i], **kwargs) for i in range(actions.shape[0])]
+            return np.stack(filtered, axis=0)
+        return actions

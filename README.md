@@ -1,480 +1,313 @@
 # LeRobot gRPC Inference
 
-基于 gRPC 的 LeRobot 推理框架，支持 Astribot 机器人控制。
+gRPC 远程推理框架：Server 端加载 LeRobot 策略模型，Client 端在 Astribot 机器人上实时执行。
 
-## 架构概览
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                                  系统架构                                            │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│  ┌───────────────────────────────┐         ┌───────────────────────────────────┐   │
-│  │      Client (机器人侧)          │  gRPC   │        Server (LeRobot)            │   │
-│  │      Astribot SDK 环境         │ ◄─────► │        Python 3.10+               │   │
-│  └───────────────────────────────┘         └───────────────────────────────────┘   │
-│                                                                                     │
-│  ┌───────────────────────────────┐         ┌───────────────────────────────────┐   │
-│  │ • AstribotCameraSubscriber    │  ────►  │ • LeRobotModelInference           │   │
-│  │   - ROS 话题订阅               │  图像   │   - 模型加载 (from_pretrained)     │   │
-│  │   - 图像采集                   │  ────►  │   - 预处理/后处理                   │   │
-│  │                               │         │   - select_action 推理             │   │
-│  │ • InferenceClient             │  ◄────  │                                    │   │
-│  │   - gRPC 通信                  │ Action │ • DatasetLoader                    │   │
-│  │   - 图像编码                   │  ◄────  │   - Parquet 数据加载               │   │
-│  │   - 配置服务端                 │         │   - V2.0 格式支持                  │   │
-│  │                               │         │                                    │   │
-│  │ • AstribotController          │         │ • LeRobotInferenceServicer        │   │
-│  │   - 两阶段控制                 │         │   - Configure/Predict/Reset       │   │
-│  │   - 动作平滑/速度限制          │         │                                    │   │
-│  │   - 实时关节状态读取 ⭐        │         │                                    │   │
-│  └───────────────────────────────┘         └───────────────────────────────────┘   │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## 特性
-
-- ✅ **V2.0 数据格式** (22/25维)
-- ✅ **输入/执行分离配置** (输入维度与执行底盘独立控制)
-- ✅ **图像传输支持** (JPEG/PNG 压缩，支持视觉策略)
-- ✅ **Client 动态配置** (Server 以空闲模式启动)
-- ✅ **两阶段控制** (路径规划 + 实时控制)
-- ✅ **ROS 相机集成** (AstribotCameraSubscriber)
-- ✅ **实时关节状态读取** ⭐ (从机器人本体获取真实反馈)
-- ✅ **数据集驱动的初始位置** ⭐ (基于数据集统计的准备位置)
-
-## 数据流
+## 架构
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                              推理数据流                                             │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                    │
-│   Client                              gRPC                              Server     │
-│                                                                                    │
-│   ┌────────────────────────────┐                                                   │
-│   │     Observation            │                                                   │
-│   │  ┌──────────────────────┐  │                                                   │
-│   │  │ state (22/25维)      │  │  ← 从机器人本体实时读取 ⭐                         │
-│   │  │ (真实关节反馈)        │  │    astribot.get_current_joints_position()        │
-│   │  └──────────────────────┘  │                                                   │
-│   │  ┌──────────────────────┐  │                                                   │
-│   │  │ images[]             │  │  ← 观测图像 (JPEG)                                │
-│   │  │  • head              │  │                                                   │
-│   │  │  • wrist_left        │  │                                                   │
-│   │  │  • wrist_right       │  │                                                   │
-│   │  └──────────────────────┘  │                                                   │
-│   └────────────────────────────┘                                                   │
-│              │                                                                     │
-│              │  Predict()                                                          │
-│              ▼                                                                     │
-│   ┌────────────────────────┐     ┌──────────────────────────────────────────────┐  │
-│   │      Action            │     │  Server 处理:                                 │  │
-│   │  ┌──────────────────┐  │     │  1. 解码 state → tensor                      │  │
-│   │  │ values (22/25维) │  │ ←── │  2. 解码 images → tensor                     │  │
-│   │  └──────────────────┘  │     │  3. policy.select_action(obs)                │  │
-│   └────────────────────────┘     │  4. 返回 action                              │  │
-│              │                   └──────────────────────────────────────────────┘  │
-│              ▼                                                                     │
-│   ┌────────────────────────┐                                                       │
-│   │     执行到机器人        │                                                       │
-│   │                        │                                                       │
-│   │  execute_chassis=False │  → 只执行前 22 维 (忽略底盘)                           │
-│   │  execute_chassis=True  │  → 执行全部 25 维 (包含底盘)                           │
-│   └────────────────────────┘                                                       │
-│                                                                                    │
-└────────────────────────────────────────────────────────────────────────────────────┘
+ ┌─────────── 机器人侧 ───────────┐          ┌────────── GPU 服务器 ──────────┐
+ │                                │          │                               │
+ │  ROS Camera ──► 图像采集        │  gRPC    │  LeRobot Policy               │
+ │  Astribot SDK ──► 关节读取      │ ◄──────► │  (ACT / Diffusion / pi0 ...)  │
+ │  AstribotController ──► 执行    │          │  PyTorch + CUDA               │
+ │  InferenceLogger ──► 日志       │          │                               │
+ └────────────────────────────────┘          └───────────────────────────────┘
+        Client (Python 3.8+)                     Server (Python 3.10+)
 ```
 
-## 关节状态读取 ⭐ 新功能
-
-### 数据来源
-
-`get_current_joint_positions()` 方法会**优先从机器人本体读取真实的关节反馈**：
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                          关节状态获取流程                                             │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   get_current_joint_positions()                                                     │
-│          │                                                                          │
-│          ▼                                                                          │
-│   ┌─────────────────────────────────────────────────────────────────────────────┐   │
-│   │  [优先] Astribot SDK 可用?                                                   │   │
-│   │         │                                                                   │   │
-│   │         ├─ YES ──► astribot.get_current_joints_position()                   │   │
-│   │         │          从机器人本体读取真实关节反馈:                               │   │
-│   │         │          • astribot_torso (4)                                     │   │
-│   │         │          • astribot_arm_left (7)                                  │   │
-│   │         │          • astribot_gripper_left (1)                              │   │
-│   │         │          • astribot_arm_right (7)                                 │   │
-│   │         │          • astribot_gripper_right (1)                             │   │
-│   │         │          • astribot_head (2)                                      │   │
-│   │         │          • astribot_chassis (3) [可选]                            │   │
-│   │         │                                                                   │   │
-│   │         └─ NO ───► 回退: 使用追踪的命令位置 (_current_waypoint)              │   │
-│   │                    或返回零向量                                              │   │
-│   └─────────────────────────────────────────────────────────────────────────────┘   │
-│          │                                                                          │
-│          ▼                                                                          │
-│   waypoint_to_lerobot_action() 格式转换                                             │
-│          │                                                                          │
-│          ▼                                                                          │
-│   返回 22/25 维 state 向量 (LeRobot 格式)                                           │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 优势
-
-| 项目 | 旧方式 (追踪命令) | 新方式 (实时读取) |
-|------|-------------------|-------------------|
-| 数据来源 | 上一帧发送的目标位置 | 机器人本体真实反馈 |
-| 误差感知 | ❌ 无法感知 | ✅ 可感知实际位置偏差 |
-| 控制精度 | 开环控制 | 闭环控制 |
-| 初始状态 | 需要先执行动作才有值 | 随时可读取真实状态 |
-
-## 维度配置 (重要)
-
-**输入维度**和**执行底盘**是独立配置的：
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `state_includes_chassis` | 输入 state 是否包含底盘 (22 vs 25维) | `False` |
-| `execute_chassis` | 执行 action 时是否控制底盘 | `False` |
-
-### 典型场景
-
-| 场景 | state_includes_chassis | execute_chassis | 说明 |
-|------|------------------------|-----------------|------|
-| 固定底座 | `False` (22维) | `False` | 不采集底盘状态，不控制底盘 |
-| 移动机器人 | `True` (25维) | `True` | 采集底盘状态，控制底盘 |
-| 有底盘但锁定 | `True` (25维) | `False` | 采集底盘状态，但不发送底盘命令 |
-
-### V2.0 数据格式
-
-```
-22维 (不含底盘):
-┌─────────────────────────────────────────────────────────────────────────┐
-│ arm_left(7) │ arm_right(7) │ gripper_L(1) │ gripper_R(1) │ head(2) │ torso(4) │
-└─────────────────────────────────────────────────────────────────────────┘
-     0-6           7-13            14             15          16-17      18-21
-
-25维 (含底盘):
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│ arm_left(7) │ arm_right(7) │ gripper_L(1) │ gripper_R(1) │ head(2) │ torso(4) │ chassis(3) │
-└──────────────────────────────────────────────────────────────────────────────────┘
-     0-6           7-13            14             15          16-17      18-21       22-24
-```
-
-## 准备位置 (Ready Position)
-
-准备位置定义在 `src/common/constants.py` 中，基于 **astribot_catlitter_datasets 数据集 200 个 episode 第一帧状态的均值** 计算得出。
-
-### READY_POSITION_22 (22维，不含底盘)
-
-```python
-READY_POSITION_22 = [
-    # arm_left (7)
-    0.154849, -0.022670, -1.421605, 1.660323, -0.346889, 0.115219, 0.126036,
-    # arm_right (7)
-    -0.161952, -0.022760, 1.418778, 1.660055, 0.343307, 0.115222, -0.123617,
-    # gripper_left (1)
-    -0.021181,
-    # gripper_right (1)
-    -0.121321,
-    # head (2)
-    -0.013063, 0.786349,
-    # torso (4)
-    0.597646, -1.195333, 0.597043, 0.009469,
-]
-```
-
-### READY_POSITION_25 (25维，含底盘)
-
-```python
-READY_POSITION_25 = READY_POSITION_22 + [
-    # chassis (3)
-    -0.000426, 0.002229, -0.069377,
-]
-```
+**核心设计：** Server 以空闲模式启动，Client 连接时通过 `Configure()` 指定模型路径，Server 动态加载。
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 安装
 
 ```bash
-pip install -r requirements.txt
+# Server 端 (GPU 服务器，需要 lerobot + torch 环境)
+pip install -r requirements-server.txt
 
-# 生成 gRPC 代码
+# Client 端 (机器人侧)
+pip install -r requirements-client.txt
+
+# 生成 gRPC 代码 (两端都要执行)
 bash scripts/generate_proto.sh
 ```
 
-### 2. 启动 Server (LeRobot 环境)
+### 2. 启动 Server
 
 ```bash
-# Server 以空闲模式启动，等待 Client 配置
 python -m src.server.inference_server --port 50051 --device cuda
 ```
 
-### 3. 启动 Client (机器人侧)
+Server 启动后处于空闲状态，等待 Client 配置。
+
+### 3. 启动 Client
 
 ```bash
-# 数据集回放 (22维, 不控制底盘)
+# 基础推理
 python -m src.client.inference_client \
     --server 192.168.1.100:50051 \
-    --dataset /path/to/lerobot_dataset \
-    --episode 0
+    --model /path/to/model
 
-# 模型推理 (22维, 不控制底盘)
+# 视觉策略 + Chunk 模式 (推荐用于 ACT/Diffusion)
 python -m src.client.inference_client \
     --server 192.168.1.100:50051 \
-    --model /path/to/trained_model
-
-# 视觉策略 (带图像)
-python -m src.client.inference_client \
-    --server 192.168.1.100:50051 \
-    --model /path/to/vision_policy \
+    --model /path/to/model \
     --enable-camera \
-    --cameras head,wrist_left,wrist_right
+    --use-chunk --n-action-steps 30
 
-# 移动机器人 (25维输入, 控制底盘)
+# 带底盘 + 平滑
 python -m src.client.inference_client \
     --server 192.168.1.100:50051 \
-    --model /path/to/mobile_policy \
-    --state-with-chassis \
-    --execute-chassis
-
-# 开启平滑和速度限制
-python -m src.client.inference_client \
-    --server 192.168.1.100:50051 \
-    --dataset /path/to/dataset \
-    --smooth 5 \
-    --max-velocity 0.05
-
-# ⭐ 推荐: 视觉策略 + Chunk模式 + 平滑 (猫砂任务)
-python -m src.client.inference_client \
-    --server 0.0.0.0:50053 \
-    --model /root/astribot_raw_datasets/astribot_catlitter/0260000_0110/pretrained_model \
-    --enable-camera \
-    --state-with-chassis \
-    --smooth 5 \
-    --use-chunk \
-    --n-action-steps 30
+    --model /path/to/model \
+    --state-with-chassis --execute-chassis \
+    --smooth 5 --max-velocity 0.05
 ```
 
-## 配置参数
-
-### Server 配置
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--host` | 0.0.0.0 | 监听地址 |
-| `--port` | 50051 | 监听端口 |
-| `--device` | cuda | 推理设备 |
-| `--workers` | 10 | 工作线程数 |
-| `--fps` | 30.0 | 目标帧率 |
-
-### Client 配置
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--server` | localhost:50051 | Server 地址 |
-| `--model` | - | 模型路径 (推理模式) |
-| `--dataset` | - | 数据集路径 (回放模式) |
-| `--device` | cuda | 推理设备 |
-| `--episode` | 0 | Episode 索引 |
-
-**输入配置:**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--state-with-chassis` | false | 输入 state 包含底盘 (25维) |
-
-**执行配置:**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--execute-chassis` | false | 执行时控制底盘 |
-| `--no-head` | false | 禁用头部控制 |
-| `--no-torso` | false | 禁用腰部控制 |
-
-**相机配置:**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--enable-camera` | false | 启用相机订阅 (视觉策略) |
-| `--cameras` | head,wrist_left,wrist_right | 相机列表 |
-
-**控制配置:**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--control-freq` | 30.0 | 控制频率 (Hz) |
-| `--move-to-ready` | true | 启动时先移动到准备位置 |
-| `--ready-duration` | 5.0 | 移动到准备位置的时间 (秒) |
-| `--smooth` | 0 | 平滑窗口 (0=不平滑) |
-| `--max-velocity` | 0.0 | 最大速度 rad/frame |
-
-## gRPC 接口
-
-```protobuf
-service LeRobotInferenceService {
-    // Client 配置 Server 使用的模型/数据集
-    rpc Configure(PolicyConfig) returns (ServiceStatus);
-    
-    // 单次推理 (发送 state + images, 返回单个 action)
-    rpc Predict(Observation) returns (Action);
-    
-    // Chunk 推理 (一次性返回完整的 action chunk)
-    // 适用于 action chunking 策略 (ACT, Diffusion 等)
-    rpc PredictChunk(Observation) returns (ActionChunk);
-    
-    // 流式推理 (双向流，高频控制)
-    rpc StreamPredict(stream Observation) returns (stream Action);
-    
-    // 控制命令 (RESET / SET_EPISODE)
-    rpc Control(ControlCommand) returns (ServiceStatus);
-    
-    // 获取状态
-    rpc GetStatus(Empty) returns (ServiceStatus);
-    
-    // 重置
-    rpc Reset(Empty) returns (ServiceStatus);
-}
-```
-
-## Action Chunking 模式
-
-对于使用 action chunking 的策略 (ACT, Diffusion 等)，支持两种推理模式：
+## 推理模式
 
 ### 单步模式 (默认)
-每次调用 `Predict` 获取一个 action，Server 内部管理 action queue。
 
-### Chunk 模式 (推荐)
-使用 `PredictChunk` 一次性获取完整的 action chunk，Client 在本地消费。
+每帧调用 `Predict()` 获取一个 action。适用于简单策略。
 
-**优势：**
-- 减少网络调用频率 (从每帧调用变为每 chunk 调用一次)
-- 降低延迟
-- 更好的控制 action 消费逻辑
+### Chunk 模式 (`--use-chunk`)
 
-```bash
-# 启用 chunk 模式
-python -m src.client.inference_client \
-    --server 192.168.1.100:50051 \
-    --model /path/to/act_model \
-    --use-chunk \
-    --n-action-steps 50  # 每个 chunk 使用前 50 个 action
-```
+调用 `PredictChunk()` 一次获取完整 action chunk，Client 在本地逐步消费。用完后再请求新 chunk。
+
+适用于 ACT、Diffusion 等 action chunking 策略。`--n-action-steps N` 控制每个 chunk 实际使用的 action 数量。
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                            Chunk 模式数据流                                          │
-├─────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   Client                                                          Server            │
-│                                                                                     │
-│   ┌────────────────────────┐                                                        │
-│   │  ActionChunkManager    │                                                        │
-│   │  ┌──────────────────┐  │                                                        │
-│   │  │ action_queue     │  │ ◄──────────────────── PredictChunk()                   │
-│   │  │ [a0, a1, ..., aN]│  │        返回完整 chunk                                   │
-│   │  └──────────────────┘  │        (chunk_size, action_dim)                        │
-│   │         │              │                                                        │
-│   │    get_action()        │        仅当 queue 空时                                  │
-│   │         │              │ ────────────────────► 请求新 chunk                      │
-│   │         ▼              │                                                        │
-│   │  ┌──────────────────┐  │                                                        │
-│   │  │ 返回单个 action   │  │                                                        │
-│   │  └──────────────────┘  │                                                        │
-│   └────────────────────────┘                                                        │
-│                                                                                     │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+Client                                Server
+  │                                     │
+  │── PredictChunk(obs) ──────────────► │
+  │                                     │── policy.select_action(obs)
+  │◄── ActionChunk [a0, a1, ..., aN] ──│
+  │                                     │
+  │  本地逐步消费 a0, a1, a2 ...        │
+  │  (无网络调用)                        │
+  │                                     │
+  │  queue 空, 再次请求                  │
+  │── PredictChunk(obs) ──────────────► │
+  │ ...                                 │
+```
+
+## Action 处理流水线
+
+Client `step()` 中，模型输出经过以下处理后发给机器人：
+
+```
+模型原始输出 (raw_action)
+    │
+    ▼
+部件过滤 (filtered_action)      ← enable_head / enable_torso / enable_chassis
+    │                              禁用的部件替换为当前关节值
+    ▼
+速度限制 (velocity_limiter)     ← --max-velocity
+    │
+    ▼
+移动平均平滑 (smoother)         ← --smooth
+    │
+    ▼
+发送到机器人 (final_action)
+```
+
+推理日志中会记录完整流水线的每个阶段（仅记录与最终值不同的阶段），便于事后分析。
+
+## V2.0 数据格式
+
+```
+22 维 (不含底盘):
+[ arm_left(7) | arm_right(7) | grip_L(1) | grip_R(1) | head(2) | torso(4) ]
+  idx 0-6       idx 7-13       idx 14      idx 15     idx 16-17  idx 18-21
+
+25 维 (含底盘):
+[ ... 同上 22 维 ... | chassis(3) ]
+                       idx 22-24
+```
+
+输入维度和执行维度独立配置：
+
+| 参数 | 作用 | 默认 |
+|------|------|------|
+| `state_includes_chassis` | Client 采集的 state 是否包含底盘 | `False` (22 维) |
+| `enable_chassis` | 执行时是否控制底盘 | `False` |
+| `enable_head` | 执行时是否控制头部 | `True` |
+| `enable_torso` | 执行时是否控制腰部 | `True` |
+
+禁用的部件在 Client 端过滤，替换为当前关节实际读数，不会发送给机器人。
+
+## 命令行参数
+
+### Server
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--host` | `0.0.0.0` | 监听地址 |
+| `--port` | `50051` | 监听端口 |
+| `--device` | `cuda` | 推理设备 |
+| `--workers` | `10` | gRPC 工作线程数 |
+| `--fps` | `30.0` | 目标帧率 |
+
+### Client
+
+**连接与模型：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--server` | `localhost:50051` | Server 地址 |
+| `--model` | - | 模型路径或 HuggingFace repo |
+| `--device` | `cuda` | 推理设备 |
+| `--policy-type` | 自动检测 | 策略类型 (act, diffusion, pi0 等) |
+
+**维度与部件控制：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--state-with-chassis` | `false` | 输入 state 包含底盘 (25 维) |
+| `--execute-chassis` | `false` | 执行时控制底盘 |
+| `--no-head` | `false` | 禁用头部控制 |
+| `--no-torso` | `false` | 禁用腰部控制 |
+
+**相机 (视觉策略)：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--enable-camera` | `false` | 启用 ROS 相机订阅 |
+| `--cameras` | `head,wrist_left,wrist_right,torso` | 订阅的相机列表 |
+
+**Chunk 模式：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--use-chunk` | `false` | 启用 chunk 模式 |
+| `--n-action-steps` | 全部 | 每个 chunk 使用的 action 数量 |
+
+**控制与平滑：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--control-freq` | `30.0` | 控制频率 (Hz) |
+| `--control-way` | `direct` | 控制方式 (`direct` / `filter`) |
+| `--smooth` | `0` | 移动平均窗口 (0 = 不平滑) |
+| `--max-velocity` | `0.0` | 最大速度 rad/frame (0 = 不限制) |
+
+**启动流程：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--move-to-ready` / `--no-move-to-ready` | 开启 | 是否先移动到准备位置 |
+| `--ready-duration` | `5.0` | 移动到准备位置耗时 (秒) |
+| `--initial-transition` | `0.0` | 初始过渡时间 (秒)，平滑过渡到第一帧 action |
+| `--episode` | `0` | Episode 索引 |
+| `--max-frames` | `10000` | 最大帧数 |
+
+**推理日志：**
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--enable-logging` / `--no-logging` | 开启 | 是否记录推理日志 |
+| `--log-dir` | `./inference_logs` | 日志保存目录 |
+| `--log-session-name` | 自动时间戳 | 日志会话名称 |
+| `--log-save-images` / `--no-log-save-images` | 保存 | 是否保存图像 |
+| `--log-image-format` | `jpg` | 图像格式 (`jpg` / `png`) |
+
+## 推理日志
+
+默认开启。每次运行生成一个 session 目录：
+
+```
+inference_logs/
+└── session_2025-01-09_12-30-45/
+    ├── metadata.json          # 会话配置、统计 (fps, 延迟, 帧数)
+    ├── inference_log.jsonl    # 逐帧数据 (JSONL, 每行一条)
+    └── images/
+        ├── frame_000000/      # 仅在推理帧保存图像
+        │   ├── head.jpg
+        │   ├── wrist_left.jpg
+        │   └── wrist_right.jpg
+        └── frame_000050/
+            └── ...
+```
+
+每条 JSONL 记录包含：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `state` | `float[]` | 关节状态 (输入) |
+| `action` | `float[]` | 最终发给机器人的 action |
+| `raw_action` | `float[]?` | 模型原始输出 (与 action 不同时记录) |
+| `filtered_action` | `float[]?` | 部件过滤后 (与 action 不同时记录) |
+| `smoothed_action` | `float[]?` | 平滑/限速后 (与 action 不同时记录) |
+| `latency_ms` | `float` | 推理延迟 (毫秒) |
+| `image_paths` | `dict` | 图像文件相对路径 |
+| `extra_info` | `dict` | 额外信息 (`is_inference_frame` 等) |
+
+### 读取日志
+
+```python
+from src.client.inference_logger import InferenceLogReader
+
+reader = InferenceLogReader("./inference_logs/session_2025-01-09_12-30-45")
+
+# 读取元信息
+metadata = reader.get_metadata()
+print(f"总帧数: {metadata['total_frames']}, 平均 FPS: {metadata.get('avg_fps', 'N/A')}")
+
+# 加载为 numpy 数组
+states, actions = reader.load_as_arrays()
+
+# 加载完整 action 处理流水线
+pipeline = reader.load_action_pipeline()
+# pipeline["raw_action"]      → 模型原始输出
+# pipeline["filtered_action"] → 部件过滤后
+# pipeline["smoothed_action"] → 平滑后
+# pipeline["final_action"]    → 发给机器人的
+
+# 加载延迟数据
+latencies = reader.load_latencies()  # shape (N,), 单位 ms
+
+# 加载图像
+img = reader.load_image(frame_index=0, camera_name="head")
 ```
 
 ## Python API
 
-### 基础推理 (不带图像)
+### InferenceClient (底层)
 
 ```python
 from src.client.inference_client import InferenceClient
 from src.common.config import ActionConfig
 
-# 创建客户端
 client = InferenceClient("192.168.1.100:50051")
 
-# 配置 Server
+# 配置
 client.configure(
     mode="model",
     model_path="/path/to/model",
     device="cuda",
-    action_config=ActionConfig(
-        state_includes_chassis=False,  # 输入 22 维
-        execute_chassis=False          # 不控制底盘
-    )
+    action_config=ActionConfig(enable_chassis=False)
 )
 
-# 推理
-response = client.predict(
-    joint_positions=[0.0] * 22,  # 当前状态
-    episode_id=0,
-    frame_index=0
-)
+# 单步推理
+response = client.predict(joint_positions=[0.0] * 22, images=images)
+action = list(response.values)
 
-action = list(response.values)  # 获取 action
-print(f"Action dim: {len(action)}, values: {action[:5]}...")
+# Chunk 推理
+chunk = client.predict_chunk(joint_positions=[0.0] * 22, images=images)
+for step in chunk.actions:
+    action = list(step.values)
 
 client.close()
 ```
 
-### 视觉策略推理 (带图像)
+### AstribotController (推荐)
+
+整合 gRPC 客户端、Astribot SDK、ROS 相机、action 后处理和日志。
 
 ```python
-from src.client.inference_client import InferenceClient, AstribotCameraSubscriber
-from src.common.config import ActionConfig
-
-# 创建相机订阅器
-camera = AstribotCameraSubscriber(['head', 'wrist_left', 'wrist_right'])
-camera.start()
-camera.wait_for_images(timeout=5.0)
-
-# 创建客户端
-client = InferenceClient("192.168.1.100:50051")
-client.configure(
-    mode="model",
-    model_path="/path/to/vision_policy",
-    action_config=ActionConfig(state_includes_chassis=False)
-)
-
-# 推理循环
-for frame_idx in range(1000):
-    # 获取图像
-    images = camera.get_images_for_inference(client)
-    
-    # 推理 (state + images → action)
-    response = client.predict(
-        joint_positions=current_state,
-        images=images,
-        frame_index=frame_idx
-    )
-    
-    action = list(response.values)
-    # 发送到机器人...
-
-camera.stop()
-client.close()
-```
-
-### 高级控制器
-
-```python
-from src.client.inference_client import AstribotController
+from src.client.inference_client import AstribotController, run_inference_loop
+from src.client.inference_logger import InferenceLogger
 from src.common.config import ClientConfig, ActionConfig
 
-# 配置
 config = ClientConfig(
     server_host="192.168.1.100",
     server_port=50051,
@@ -482,109 +315,61 @@ config = ClientConfig(
     control_freq=30.0,
     smooth_window=5,
     max_velocity=0.05,
-    action_config=ActionConfig(
-        state_includes_chassis=False,  # 输入 22 维
-        execute_chassis=False          # 不控制底盘
-    )
+    action_config=ActionConfig(enable_chassis=False)
 )
 
-# 创建控制器 (带相机)
+inference_logger = InferenceLogger(log_dir="./inference_logs", save_images=True)
+
 controller = AstribotController(
     config,
     enable_camera=True,
-    camera_names=['head', 'wrist_left', 'wrist_right']
+    camera_names=['head', 'wrist_left', 'wrist_right'],
+    use_chunk=True,
+    n_action_steps=30,
+    inference_logger=inference_logger,
 )
 
-# 设置 episode
-controller.set_episode(0)
-
-# 移动到准备位置 (路径规划)
-controller.move_to_ready_position(duration=5.0)
-
-# 实时控制循环
-while True:
-    # step() 内部调用 get_current_joint_positions()
-    # 会从机器人本体读取真实关节状态 ⭐
-    if not controller.step():
-        break
-    time.sleep(1.0 / 30)
-
+# 一键运行: 准备位置 → 实时推理循环
+run_inference_loop(controller, episode=0, max_frames=10000)
 controller.close()
 ```
 
-### Chunk 模式控制器 (推荐用于 ACT/Diffusion)
-
-```python
-from src.client.inference_client import AstribotController, ActionChunkManager
-from src.common.config import ClientConfig, ActionConfig
-
-# 配置
-config = ClientConfig(
-    server_host="192.168.1.100",
-    server_port=50051,
-    model_path="/path/to/act_model",
-    control_freq=30.0,
-    action_config=ActionConfig(state_includes_chassis=False)
-)
-
-# 创建控制器 (使用 chunk 模式)
-controller = AstribotController(
-    config,
-    use_chunk=True,           # 启用 chunk 模式
-    n_action_steps=50         # 每个 chunk 使用前 50 个 action
-)
-
-# 控制循环 (内部自动管理 chunk)
-controller.set_episode(0)
-controller.move_to_ready_position(duration=5.0)
-
-while True:
-    if not controller.step():  # 自动从本地 queue 获取 action，queue 空时请求新 chunk
-        break
-    time.sleep(1.0 / 30)
-
-controller.close()
-```
-
-### 直接使用 ActionChunkManager
+### ActionChunkManager (独立使用)
 
 ```python
 from src.client.inference_client import InferenceClient, ActionChunkManager
 
-# 创建客户端
 client = InferenceClient("192.168.1.100:50051")
 client.configure(mode="model", model_path="/path/to/act_model")
 
-# 创建 chunk 管理器
-chunk_manager = ActionChunkManager(
-    client=client,
-    n_action_steps=50,        # 每个 chunk 使用前 50 个 action
-    auto_refill_threshold=0.0 # 用完再请求新 chunk
-)
+chunk_mgr = ActionChunkManager(client, n_action_steps=50)
 
-# 控制循环
-for frame_idx in range(1000):
-    current_state = get_robot_state()
-    images = get_camera_images()
-    
-    # 获取 action (自动管理 chunk 请求)
-    action = chunk_manager.get_action(
+for frame in range(1000):
+    action = chunk_mgr.get_action(
         joint_positions=current_state,
         images=images,
-        episode_id=0,
-        frame_index=frame_idx
+        frame_index=frame
     )
-    
     if action is None:
-        print("Episode 结束")
         break
-    
-    # 发送到机器人
     send_to_robot(action)
-    time.sleep(1.0 / 30)
-
-client.close()
 ```
+
+## gRPC 接口
+
+```protobuf
+service LeRobotInferenceService {
+    rpc Configure(PolicyConfig) returns (ServiceStatus);
+    rpc Predict(Observation) returns (Action);
+    rpc PredictChunk(Observation) returns (ActionChunk);
+    rpc StreamPredict(stream Observation) returns (stream Action);
+    rpc Control(ControlCommand) returns (ServiceStatus);
+    rpc GetStatus(Empty) returns (ServiceStatus);
+    rpc Reset(Empty) returns (ServiceStatus);
+}
+```
+
+完整 proto 定义见 `proto/lerobot_inference.proto`。
 
 ## ROS 相机话题
 
@@ -595,79 +380,34 @@ client.close()
 | `wrist_right` | `/astribot_camera/right_wrist_rgbd/color_compress/compressed` | 640x360 |
 | `torso` | `/astribot_camera/torso_rgbd/color_compress/compressed` | 1280x720 |
 
-## 两阶段控制流程
-
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                           两阶段控制                                           │
-├───────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  ╔═════════════════════════════════════════════════════════════════════════╗  │
-│  ║  阶段 1: 移动到准备位置 (Ready Position)                                   ║  │
-│  ║                                                                         ║  │
-│  ║  • 使用预设的 READY_POSITION_22/25 (constants.py)                       ║  │
-│  ║  • 基于数据集统计的初始位置均值 ⭐                                        ║  │
-│  ║  • 使用 move_joints_waypoints() 轨迹规划                                ║  │
-│  ║  • 耗时: ready_duration 秒 (默认 5.0s)                                  ║  │
-│  ╚═════════════════════════════════════════════════════════════════════════╝  │
-│                                     │                                         │
-│                                     ▼                                         │
-│  ╔═════════════════════════════════════════════════════════════════════════╗  │
-│  ║  阶段 2: 实时控制 (Real-time)                                             ║  │
-│  ║                                                                         ║  │
-│  ║  循环 @ control_freq Hz:                                                 ║  │
-│  ║    1. 获取当前关节位置 (从机器人本体实时读取) ⭐                            ║  │
-│  ║    2. 获取相机图像 (images) - 如果启用                                    ║  │
-│  ║    3. 发送 Predict 请求 (state + images)                                 ║  │
-│  ║    4. 应用速度限制 (VelocityLimiter)                                     ║  │
-│  ║    5. 应用动作平滑 (ActionSmoother)                                      ║  │
-│  ║    6. 发送 set_joints_position 到机器人                                  ║  │
-│  ╚═════════════════════════════════════════════════════════════════════════╝  │
-│                                                                               │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
-
 ## 项目结构
 
 ```
 lerobot_grpc_inference/
-├── proto/                          # Protocol Buffers 定义
-│   └── lerobot_inference.proto
+├── proto/
+│   └── lerobot_inference.proto     # gRPC 接口定义
 ├── src/
-│   ├── common/                     # 共享模块
-│   │   ├── config.py              # 配置管理 (ActionConfig, ServerConfig, ClientConfig)
-│   │   ├── constants.py           # 常量定义 (READY_POSITION, 维度配置)
-│   │   └── utils.py               # 工具函数 (平滑器, 速度限制器, 格式转换)
-│   ├── server/                     # Server 端代码
-│   │   └── inference_server.py    # gRPC 服务, DatasetLoader, ModelInference
-│   ├── client/                     # Client 端代码
-│   │   ├── inference_client.py    # InferenceClient, AstribotController, CameraSubscriber
-│   │   └── inference_logger.py    # 推理日志记录
+│   ├── common/
+│   │   ├── constants.py            # 维度、索引、准备位置、gRPC 常量
+│   │   ├── config.py               # ActionConfig, ServerConfig, ClientConfig
+│   │   ├── utils.py                # 平滑器、速度限制器、格式转换、部件过滤
+│   │   └── proto_imports.py        # 共享 protobuf 导入逻辑
+│   ├── server/
+│   │   └── inference_server.py     # gRPC 服务、LeRobotModelInference
+│   ├── client/
+│   │   ├── inference_client.py     # InferenceClient, AstribotController, ActionChunkManager
+│   │   └── inference_logger.py     # InferenceLogger, InferenceLogReader
 │   └── generated/                  # 自动生成的 gRPC 代码
-├── scripts/                        # 脚本
-│   ├── generate_proto.sh          # 生成 gRPC 代码
-│   ├── run_server.sh              # 启动 Server
-│   └── run_client.sh              # 启动 Client
-├── inference_logs/                 # 推理日志输出目录
-├── requirements.txt
-└── README.md
+├── scripts/
+│   ├── generate_proto.sh
+│   ├── run_server.sh
+│   └── run_client.sh
+├── config/
+│   └── default.json
+├── requirements.txt                # 公共依赖 (grpc, numpy)
+├── requirements-server.txt         # Server 额外依赖 (torch, lerobot)
+└── requirements-client.txt         # Client 额外依赖 (Astribot SDK)
 ```
-
-## 更新日志
-
-### v1.1.0 (2026-01-10)
-
-- ⭐ **实时关节状态读取**: `get_current_joint_positions()` 现在从机器人本体实时读取真实关节反馈，而非追踪发送的命令
-- ⭐ **数据集驱动的初始位置**: `READY_POSITION_22/25` 更新为 astribot_catlitter_datasets 200个episode第一帧状态的均值
-- 改进: 添加回退机制 - SDK 不可用时自动回退到追踪模式
-
-### v1.0.0
-
-- 初始版本
-- V2.0 数据格式支持 (22/25维)
-- gRPC 推理接口
-- Action Chunking 支持
-- 两阶段控制流程
 
 ## 许可证
 

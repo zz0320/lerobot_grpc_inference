@@ -4,7 +4,6 @@
     "port": 50051,
     "max_workers": 10,
     "model_path": null,
-    "dataset_path": null,
     "device": "cuda",
     "fps": 30.0
   },
